@@ -1,0 +1,12 @@
+# Collection of Watermark methods
+- [DwtDct](https://github.com/ShieldMnt/invisible-watermark?utm_source=chatgpt.com)
+- [RivaGAN](https://github.com/DAI-Lab/RivaGAN)
+- [SSL](https://github.com/facebookresearch/ssl_watermarking) (by Facebook)
+- [TrustMark](https://github.com/adobe/trustmark)
+- StegaStamp git
+- TreeRing git 
+- StableSignature git
+- RingID git
+- GaussianShading git
+- Watermark Anything (WAM) git (Meta)
+- WAVES 
