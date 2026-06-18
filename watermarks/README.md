@@ -10,3 +10,7 @@
 - ~~[ ] GaussianShading [Github](https://github.com/bsmhmmlf/Gaussian-Shading)~~ (generative only)
 - [x] Watermark Anything (WAM) [Github](https://github.com/facebookresearch/watermark-anything)
 - [ ] WAVES [Github](https://github.com/umd-huang-lab/WAVES)
+- [ ] VINE [Github](https://github.com/Shilin-LU/VINE)
+- [ ] EditGuard [Github](https://github.com/xuanyuzhang21/EditGuard)
+- [ ] OmniGuard [Github]()
+- [ ] distseal [Github](https://github.com/facebookresearch/distseal)
