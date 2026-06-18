@@ -1,7 +1,12 @@
 import importlib
 import os
 
-watermarks = ['ssl_watermarking']
+watermarks = [
+    'dwt_dct',
+    'ssl_watermarking',
+    'trustmark',
+    'watermark_anything',
+]
 
 image_list = ['sample.jpg']
 

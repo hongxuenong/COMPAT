@@ -1,0 +1,23 @@
+[package]
+name = "trustmark-cli"
+description = "A CLI for trustmark encoding/decoding"
+version = "0.1.0"
+authors = [
+  "John Collomosse <collomos@adobe.com>",
+  "Maurice Fisher <mfisher@adobe.com>",
+  "Andrew Halle <ahalle@adobe.com>",
+]
+license = "MIT"
+keywords = ["trustmark", "cv", "watermark", "cli"]
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "trustmark"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5.20", features = ["derive"] }
+image = "0.25.6"
+rand = "0.8.5"
+trustmark = { path = "../.." }

@@ -1,7 +1,12 @@
 import importlib
 import os
 
-watermarks = ['ssl_watermarking']
+watermarks = [
+    'dwt_dct',
+    'ssl_watermarking',
+    'trustmark',
+    'watermark_anything',
+]
 
 image_list = ['sample.jpg']
 
@@ -15,6 +20,11 @@ for wm in watermarks:
         if not os.path.exists(image):
             print(f"[{wm}] Skipping {image}: file not found")
             continue
-        output_path = os.path.join(wm_dir, os.path.basename(image))
-        out = mod.add_watermark(image, output_path=output_path)
-        print(f"[{wm}] Watermarked {image} -> {out}")
+        try:
+            output_path = os.path.join(wm_dir, os.path.basename(image))
+            out = mod.add_watermark(image, output_path=output_path)
+            print(f"[{wm}] Watermarked {image} -> {out}")
+        except NotImplementedError as e:
+            print(f"[{wm}] Skipped: {e}")
+        except Exception as e:
+            print(f"[{wm}] Error on {image}: {e}")

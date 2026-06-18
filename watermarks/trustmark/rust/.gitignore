@@ -1,0 +1,14 @@
+/target
+
+/models/*
+!/models/.gitkeep
+
+/env/
+
+*.py
+
+.envrc
+
+.DS_Store
+
+*.png
