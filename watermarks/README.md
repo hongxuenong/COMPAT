@@ -1,6 +1,6 @@
 # Collection of Watermark methods
-- [DwtDct](https://github.com/ShieldMnt/invisible-watermark?utm_source=chatgpt.com)
-- [ ][RivaGAN](https://github.com/DAI-Lab/RivaGAN)
+- [ ] [DwtDct](https://github.com/ShieldMnt/invisible-watermark?utm_source=chatgpt.com)
+- [ ] [RivaGAN](https://github.com/DAI-Lab/RivaGAN)
 - [x] [SSL](https://github.com/facebookresearch/ssl_watermarking) (by Facebook)
 - [ ] [TrustMark](https://github.com/adobe/trustmark)
 - [ ] StegaStamp git
