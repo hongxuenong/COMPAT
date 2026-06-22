@@ -6,6 +6,9 @@ watermarks = [
     'ssl_watermarking',
     'trustmark',
     'watermark_anything',
+    'vine',
+    'editguard',
+    'omniguard',
 ]
 
 image_list = ['sample.jpg']
@@ -13,7 +16,11 @@ image_list = ['sample.jpg']
 out_dir = 'output'
 
 for wm in watermarks:
-    mod = importlib.import_module(wm)
+    try:
+        mod = importlib.import_module(wm)
+    except Exception as e:
+        print(f"[{wm}] Skipped (import failed): {e}")
+        continue
     wm_dir = os.path.join(out_dir, wm)
     os.makedirs(wm_dir, exist_ok=True)
     for image in image_list:
