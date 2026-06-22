@@ -14,3 +14,6 @@
 - [x] EditGuard [Github](https://github.com/xuanyuzhang21/EditGuard)
 - [x] OmniGuard [Github](https://github.com/xuanyuzhang21/OmniGuard)
 - ~~distseal [Github](https://github.com/facebookresearch/distseal)~~ (requires generative model VAE)
+- [ ] MuST, AAAI 2024 [Github](https://github.com/MrCrims/MuST)
+- [ ] OptMark, AAAI 2026
+- [ ] ScreenMark, AAAI 2025
