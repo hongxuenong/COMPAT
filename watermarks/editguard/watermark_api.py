@@ -74,11 +74,11 @@ class _EditGuardRedirect:
         self._active = False
 
     def load_module(self, name):
-        if name in sys.modules:
-            return sys.modules[name]
-
         reg = _PKG_NAME + '.' + name
         if reg in sys.modules:
+            # Already loaded under the private prefix — rebind the public name
+            # (the entry in sys.modules[name] might be a stale flat module
+            # from another library; overwrite it with our isolated copy).
             sys.modules[name] = sys.modules[reg]
             return sys.modules[name]
 
