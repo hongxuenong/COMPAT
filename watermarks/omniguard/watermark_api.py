@@ -263,7 +263,7 @@ def _build_mask_extractor(ckpt_dir):
         if not os.path.exists(mask_path):
             raise FileNotFoundError(_DOWNLOAD_MSG)
         extractor = iml_vit_model()
-        extractor.load_state_dict(torch.load(mask_path, map_location='cpu')['model'],
+        extractor.load_state_dict(torch.load(mask_path, map_location='cpu',weights_only=False)['model'],
                                   strict=True)
         extractor = extractor.to(device).eval()
 
