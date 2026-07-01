@@ -412,7 +412,7 @@ def verify_watermark(image_path, ckpt_path=None, message=None):
         outputsize = 1024
         ablu_my = albu.Compose([
             albu.PadIfNeeded(min_height=outputsize, min_width=outputsize,
-                             border_mode=0, value=0, position='top_left', mask_value=0),
+                             border_mode=0, fill=0, position='top_left', fill_mask=0),
             albu.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             albu.Crop(0, 0, outputsize, outputsize),
             ToTensorV2(),
