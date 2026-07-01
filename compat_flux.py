@@ -12,7 +12,10 @@ from diffusers.utils import load_image
 device = "cuda"
 dtype  = torch.bfloat16
 
-_MODEL_PATH = "/data/zilin_wang/alc_tasks/video_gen/FLUX.2-klein-4B"
+_MODEL_PATH = os.environ.get(
+    "COMPAT_FLUX_MODEL",
+    "/data/zilin_wang/alc_tasks/video_gen/FLUX.2-klein-4B",
+)
 
 pipeline = Flux2KleinPipeline.from_pretrained(
     _MODEL_PATH,
