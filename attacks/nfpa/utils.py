@@ -1176,7 +1176,7 @@ class TreeRingWatermark:
     
     def __init__(
         self,
-        checkpoint="stabilityai/stable-diffusion-2-1-base",
+        checkpoint="Manojb/stable-diffusion-2-1-base",
         device="cuda",
         image_size=512,
         watermark_channel=3,

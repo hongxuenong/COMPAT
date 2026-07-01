@@ -42,11 +42,18 @@ import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 from PIL import Image
 
-# Make the vendored upstream ``utils.py`` (MyStableDiffusionPipeline) importable
-# regardless of the current working directory.
 _DIR = os.path.dirname(os.path.abspath(__file__))
-if _DIR not in sys.path:
-    sys.path.insert(0, _DIR)
+
+import importlib.util as _ilu
+
+def _load_nfpa_utils():
+    """Load nfpa/utils.py by path to avoid colliding with ssl_watermarking/utils.py."""
+    spec = _ilu.spec_from_file_location("nfpa_utils", os.path.join(_DIR, "utils.py"))
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+_nfpa_utils = _load_nfpa_utils()
 
 from diffusers import DDIMScheduler, DDIMInverseScheduler
 
@@ -55,7 +62,7 @@ from diffusers import DDIMScheduler, DDIMInverseScheduler
 # NFPA_MODEL (or NFPA_MODEL_PATH) environment variable to use a local checkpoint.
 _DEFAULT_MODEL = os.environ.get(
     "NFPA_MODEL",
-    os.environ.get("NFPA_MODEL_PATH", "stabilityai/stable-diffusion-2-1-base"),
+    os.environ.get("NFPA_MODEL_PATH", "Manojb/stable-diffusion-2-1-base"),
 )
 
 # SD latent space operates on 512x512 for SD 2.1 base; the upstream attack runs
@@ -77,7 +84,7 @@ def _get_pipe():
     """Load ``MyStableDiffusionPipeline`` once and cache it."""
     global _PIPE
     if _PIPE is None:
-        from utils import MyStableDiffusionPipeline
+        MyStableDiffusionPipeline = _nfpa_utils.MyStableDiffusionPipeline
 
         pipe = MyStableDiffusionPipeline.from_pretrained(
             _DEFAULT_MODEL, torch_dtype=_dtype

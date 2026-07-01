@@ -85,8 +85,12 @@ class _OmniGuardRedirect:
         return None
 
     def load_module(self, name):
-        if name in sys.modules:
-            return sys.modules[name]
+        # Check the private-namespaced copy first: if it's already there it was
+        # successfully loaded by *our* redirect, so just rebind the public name.
+        # We deliberately do NOT check sys.modules[name] here — that entry may be
+        # a partial stub left over from a previous failed import attempt (e.g. a
+        # missing dependency that raised mid-way through exec_module), which would
+        # cause "cannot import name 'Model'" even though the module exists.
         reg = _PKG_NAME + '.' + name
         if reg in sys.modules:
             sys.modules[name] = sys.modules[reg]
@@ -104,7 +108,12 @@ class _OmniGuardRedirect:
                 mod.__package__ = reg
                 sys.modules[reg] = mod
                 sys.modules[name] = mod
-                spec.loader.exec_module(mod)
+                try:
+                    spec.loader.exec_module(mod)
+                except Exception:
+                    sys.modules.pop(reg, None)
+                    sys.modules.pop(name, None)
+                    raise
             else:
                 spec = importlib.machinery.ModuleSpec(reg, None, is_package=True)
                 spec.submodule_search_locations = [p]
@@ -121,7 +130,12 @@ class _OmniGuardRedirect:
                                if len(parts) > 1 else _PKG_NAME)
             sys.modules[reg] = mod
             sys.modules[name] = mod
-            spec.loader.exec_module(mod)
+            try:
+                spec.loader.exec_module(mod)
+            except Exception:
+                sys.modules.pop(reg, None)
+                sys.modules.pop(name, None)
+                raise
         return sys.modules[name]
 
 
