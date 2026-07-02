@@ -95,7 +95,12 @@ class _EditGuardRedirect:
             mod.__package__ = reg
             sys.modules[reg] = mod
             sys.modules[name] = mod
-            spec.loader.exec_module(mod)
+            try:
+                spec.loader.exec_module(mod)
+            except Exception:
+                sys.modules.pop(reg, None)
+                sys.modules.pop(name, None)
+                raise
         elif os.path.isdir(p):
             # namespace package (no __init__.py)
             spec = importlib.machinery.ModuleSpec(reg, None, is_package=True)
@@ -114,7 +119,12 @@ class _EditGuardRedirect:
                                if len(parts) > 1 else _PKG_NAME)
             sys.modules[reg] = mod
             sys.modules[name] = mod
-            spec.loader.exec_module(mod)
+            try:
+                spec.loader.exec_module(mod)
+            except Exception:
+                sys.modules.pop(reg, None)
+                sys.modules.pop(name, None)
+                raise
 
         return sys.modules[name]
 
@@ -160,24 +170,30 @@ def _load_model(ckpt_path=None):
         return _MODEL_CACHE[ckpt]
 
     _install_redirect()
+    try:
+        # These imports are intercepted by _EditGuardRedirect -> _editguard_lib.*
+        import options.options as option
+        from models import create_model
 
-    # These imports are intercepted by _EditGuardRedirect -> _editguard_lib.*
-    import options.options as option
-    from models import create_model
+        # is_train=True mirrors the demo (test_gradio/app.py): it populates the
+        # opt['path'] entries the model constructor expects.
+        opt = option.parse(_CONFIG_PATH, is_train=True)
+        opt['dist'] = False
+        opt = option.dict_to_nonedict(opt)
 
-    # is_train=True mirrors the demo (test_gradio/app.py): it populates the
-    # opt['path'] entries the model constructor expects.
-    opt = option.parse(_CONFIG_PATH, is_train=True)
-    opt['dist'] = False
-    opt = option.dict_to_nonedict(opt)
+        torch.backends.cudnn.benchmark = True
 
-    torch.backends.cudnn.benchmark = True
+        model = create_model(opt)
+        model.load_test(ckpt)
 
-    model = create_model(opt)
-    model.load_test(ckpt)
-
-    _MODEL_CACHE[ckpt] = model
-    return model
+        _MODEL_CACHE[ckpt] = model
+        return model
+    finally:
+        # Deactivate after all EditGuard imports are complete so the redirect
+        # does not permanently intercept 'utils', 'models', etc. for other
+        # watermark methods loaded in the same process.
+        if _REDIRECT is not None:
+            _REDIRECT._active = False
 
 
 # --------------------------------------------------------------------------- #
