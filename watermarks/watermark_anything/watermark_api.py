@@ -128,7 +128,7 @@ def verify_watermark(image_path, msg=None):
     with torch.no_grad():
         preds = wam.detect(img_w)['preds']
 
-    mask_preds   = torch.sigmoid(preds[:, 0, :, :])
+    mask_preds   = torch.sigmoid(preds[:, 0:1, :, :])   # keep (B,1,H,W) for msg_predict_inference
     bit_preds    = preds[:, 1:, :, :]
     pred_message = msg_predict_inference(bit_preds, mask_preds).cpu().float()
     bit_acc      = (pred_message == ref_msg.cpu()).float().mean().item()
