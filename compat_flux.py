@@ -34,19 +34,29 @@ def remove_watermark(image_path: str, out_dir: str = "recon", scale: float = 0.2
     img = TF.to_tensor(pil_image).unsqueeze(0)   # (1, 3, H, W) in [0, 1]
     _, _, H, W = img.shape
 
+    # Pad to the nearest multiple of 16 with black (zero) pixels
+    H_pad = (16 - H % 16) % 16
+    W_pad = (16 - W % 16) % 16
+    if H_pad or W_pad:
+        img = F.pad(img, (0, W_pad, 0, H_pad), value=0.)
+
     lr = F.interpolate(img, scale_factor=scale, mode="bilinear",
                        align_corners=False, antialias=True)
     lr_pil = TF.to_pil_image(lr[0].clamp(0, 1))
 
     result = pipeline(
-        prompt="denoise the image and make the image clear.",
+        prompt="denoise the image and make the image clear. Keep the content and color of the image unchanged",
         image=[lr_pil],
-        height=H,
-        width=W,
+        height=img.shape[-2],
+        width=img.shape[-1],
         guidance_scale=1.0,
         num_inference_steps=4,
         generator=torch.Generator(device=device).manual_seed(0),
     ).images[0]
+
+    # Crop back to original dimensions if padding was applied
+    if H_pad or W_pad:
+        result = result.crop((0, 0, W, H))
 
     os.makedirs(out_dir, exist_ok=True)
     image_name = os.path.basename(image_path)
@@ -57,4 +67,4 @@ def remove_watermark(image_path: str, out_dir: str = "recon", scale: float = 0.2
 
 
 if __name__ == "__main__":
-    remove_watermark("test_images/gemini.png")
+    remove_watermark("/data/xuenong_hong/dataset/aigc/watermark_benchmark/watermarked/watermark_anything/000000000776.jpg")

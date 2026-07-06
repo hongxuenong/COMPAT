@@ -1,5 +1,5 @@
 """
-Image quality metrics: PSNR and SSIM.
+Image quality metrics: PSNR, SSIM, and LPIPS.
 
 All functions accept either:
   - torch.Tensor  (B, C, H, W) or (C, H, W), float, in [0, 1] or [-1, 1]
@@ -12,6 +12,7 @@ The `data_range` parameter defines the value range of the inputs
 import numpy as np
 import torch
 import torch.nn.functional as F
+import lpips as _lpips_lib
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -135,20 +136,68 @@ def ssim(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# LPIPS
+# ─────────────────────────────────────────────────────────────────────────────
+
+_lpips_model = None
+
+
+def _get_lpips_model(device):
+    global _lpips_model
+    if _lpips_model is None:
+        _lpips_model = _lpips_lib.LPIPS(net='vgg').to(device)
+        _lpips_model.eval()
+    return _lpips_model
+
+
+def lpips(img1, img2, data_range: float = 1.0) -> float:
+    """
+    Learned Perceptual Image Patch Similarity (LPIPS, VGG backbone).
+
+    Lower is more similar (0 = identical perceptually).
+
+    Args:
+        img1, img2  : images to compare (numpy or tensor, same shape).
+        data_range  : value range of the inputs (1.0 for [0,1], 255 for uint8,
+                      2.0 for [-1,1]).  Used to normalise to [-1, 1] before
+                      passing to the LPIPS network.
+
+    Returns:
+        Mean LPIPS distance across the batch (float).
+    """
+    t1 = _to_float_tensor(img1)
+    t2 = _to_float_tensor(img2)
+
+    # Normalise to [-1, 1] as expected by the LPIPS network
+    if data_range != 2.0:
+        t1 = (t1 / data_range) * 2.0 - 1.0
+        t2 = (t2 / data_range) * 2.0 - 1.0
+
+    model = _get_lpips_model(t1.device)
+    with torch.no_grad():
+        dist = model(t1.to(next(model.parameters()).device),
+                     t2.to(next(model.parameters()).device))
+    return dist.mean().item()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Combined evaluation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def evaluate(img1, img2, data_range: float = 1.0) -> dict:
+def evaluate(img1, img2, data_range: float = 1.0, compute_lpips: bool = True) -> dict:
     """
-    Compute both PSNR and SSIM in one call.
+    Compute PSNR, SSIM, and optionally LPIPS in one call.
 
     Returns:
-        {'psnr': float (dB), 'ssim': float}
+        {'psnr': float (dB), 'ssim': float, 'lpips': float}
     """
-    return {
+    result = {
         'psnr': psnr(img1, img2, data_range=data_range),
         'ssim': ssim(img1, img2, data_range=data_range),
     }
+    if compute_lpips:
+        result['lpips'] = lpips(img1, img2, data_range=data_range)
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -156,7 +205,7 @@ def evaluate(img1, img2, data_range: float = 1.0) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    # Identical images → PSNR=inf, SSIM=1
+    # Identical images → PSNR=inf, SSIM=1, LPIPS≈0
     x = torch.rand(2, 3, 256, 256)
     print('Identical:', evaluate(x, x))
 
