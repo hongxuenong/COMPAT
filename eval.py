@@ -32,9 +32,11 @@ import csv
 import importlib
 import sys
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from PIL import Image
 
@@ -47,43 +49,44 @@ if _WM_DIR not in sys.path:
     sys.path.insert(0, _WM_DIR)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TEST_FOLDER = "test_folder"      # root containing <method>/<images> sub-dirs
-OUT_DIR     = "eval_out"         # root output directory
-CSV_PATH    = "eval_results.csv" # results table
+TEST_FOLDER     = "test_folder"      # root containing <wm_method>/<images> sub-dirs
+OUT_DIR         = "eval_out"         # root: OUT_DIR/<removal_method>/<wm_method>/scale_*/
+CSV_PATH        = "eval_results.csv" # results table
+ATTACK_SCALES   = [0.25, 0.5]        # downsample scales to evaluate
+REMOVAL_METHODS = ["compat_flux_v2"]    # module names to import remove_watermark from
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 
 # ── CSV schema ────────────────────────────────────────────────────────────────
 FIELDS = [
+    "removal_method",   # which removal pipeline was used
     "image",            # filename (not full path)
-    "method",           # watermark method name
+    "wm_method",        # watermark embedding method name
+    "scale",            # downsample scale used for the attack
     "wm_detected",      # watermark present in watermarked image (sanity check)
     "attacked_detected",# watermark present after removal attack
     "psnr",             # dB, watermarked vs reconstruction
     "ssim",             # [−1,1], watermarked vs reconstruction
+    "lpips",            # perceptual distance (lower = more similar)
     "error",            # non-empty if any step raised an exception
 ]
 
 SUMMARY_CSV   = "eval_summary.csv"
 SUMMARY_FIELDS = [
-    "method",
+    "removal_method",
+    "wm_method",
+    "scale",
     "total",             # images processed without fatal error
     "wm_accuracy",       # fraction detected before attack  (higher = embedding works)
     "attacked_accuracy", # fraction detected after attack   (lower  = attack works)
     "avg_psnr",
     "avg_ssim",
+    "avg_lpips",
 ]
 
-# ── Load removal pipeline (Flux2KleinPipeline) ───────────────────────────────
-# Models are loaded once at import time; skip with SKIP_REMOVAL=1 for dry-runs.
-if os.environ.get("SKIP_REMOVAL") == "1":
-    def remove_watermark(image_path, out_dir="recon", scale=0.25):
-        raise NotImplementedError("SKIP_REMOVAL mode — removal disabled")
-else:
-    from compat_flux import remove_watermark
-
 # ── Metrics ───────────────────────────────────────────────────────────────────
-from metric import psnr as _psnr, ssim as _ssim
+from metric import MetricEvaluator
+_metrics = MetricEvaluator()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -104,22 +107,6 @@ def _to_tensor(pil_img):
     """PIL RGB → (1, 3, H, W) float32 in [0, 1]."""
     return TF.to_tensor(pil_img.convert("RGB")).unsqueeze(0)
 
-
-def _load_metric_pair(orig_path, recon_path):
-    """
-    Load both images as tensors, resize the reconstruction to the original
-    dimensions if they differ (PSNR/SSIM require same spatial size).
-    Returns (orig_tensor, recon_tensor) each (1, 3, H, W) in [0, 1].
-    """
-    orig  = _to_tensor(Image.open(orig_path))
-    recon = _to_tensor(Image.open(recon_path))
-    _, _, H, W = orig.shape
-    _, _, Hr, Wr = recon.shape
-    if H != Hr or W != Wr:
-        import torch.nn.functional as F
-        recon = F.interpolate(recon, size=(H, W), mode="bilinear",
-                              align_corners=False, antialias=True)
-    return orig, recon
 
 
 def _get_detected(result: dict):
@@ -143,6 +130,19 @@ def _load_method(name):
         return None
 
 
+def _load_removal_method(name):
+    """Import remove_watermark from a removal method module. Returns None on failure."""
+    if os.environ.get("SKIP_REMOVAL") == "1":
+        def _stub(image_path, out_dir="recon", scale=0.25):
+            raise NotImplementedError("SKIP_REMOVAL mode — removal disabled")
+        return _stub
+    try:
+        return importlib.import_module(name).remove_watermark
+    except Exception as e:
+        print(f"[removal:{name}] Cannot import: {e}")
+        return None
+
+
 # ── Accuracy accumulator ─────────────────────────────────────────────────────
 
 class _MethodStats:
@@ -152,11 +152,12 @@ class _MethodStats:
         self.atk_detected_count   = 0   # detected=True after attack
         self.wm_with_decision     = 0   # rows where detected is not None
         self.atk_with_decision    = 0
-        self.psnr_sum = 0.0
-        self.ssim_sum = 0.0
+        self.psnr_sum  = 0.0
+        self.ssim_sum  = 0.0
+        self.lpips_sum = 0.0
         self.metric_count = 0
 
-    def update(self, wm_detected, attacked_detected, psnr_val, ssim_val):
+    def update(self, wm_detected, attacked_detected, psnr_val, ssim_val, lpips_val):
         self.total += 1
         if wm_detected is not None:
             self.wm_with_decision += 1
@@ -167,22 +168,27 @@ class _MethodStats:
         if psnr_val != "":
             self.psnr_sum  += float(psnr_val)
             self.ssim_sum  += float(ssim_val)
+            self.lpips_sum += float(lpips_val)
             self.metric_count += 1
 
-    def summary(self, method_name):
+    def summary(self, removal_name, method_name, scale):
         wm_acc  = (self.wm_detected_count  / self.wm_with_decision
                    if self.wm_with_decision  else None)
         atk_acc = (self.atk_detected_count / self.atk_with_decision
                    if self.atk_with_decision else None)
-        avg_psnr = self.psnr_sum / self.metric_count if self.metric_count else None
-        avg_ssim = self.ssim_sum / self.metric_count if self.metric_count else None
+        avg_psnr  = self.psnr_sum  / self.metric_count if self.metric_count else None
+        avg_ssim  = self.ssim_sum  / self.metric_count if self.metric_count else None
+        avg_lpips = self.lpips_sum / self.metric_count if self.metric_count else None
         return {
-            "method":            method_name,
+            "removal_method":    removal_name,
+            "wm_method":         method_name,
+            "scale":             scale,
             "total":             self.total,
             "wm_accuracy":       round(wm_acc,  4) if wm_acc  is not None else "",
             "attacked_accuracy": round(atk_acc, 4) if atk_acc is not None else "",
-            "avg_psnr":          round(avg_psnr, 4) if avg_psnr is not None else "",
-            "avg_ssim":          round(avg_ssim, 4) if avg_ssim is not None else "",
+            "avg_psnr":          round(avg_psnr,  4) if avg_psnr  is not None else "",
+            "avg_ssim":          round(avg_ssim,  4) if avg_ssim  is not None else "",
+            "avg_lpips":         round(avg_lpips, 4) if avg_lpips is not None else "",
         }
 
 
@@ -198,78 +204,116 @@ def main():
     if not csv_exists:
         writer.writeheader()
 
-    all_stats = {}   # method_name -> _MethodStats
+    all_stats = {}   # (removal_name, wm_method, scale) -> _MethodStats
 
     try:
-        for method_name, images in _iter_method_dirs(TEST_FOLDER):
-            mod = _load_method(method_name)
+        for wm_method, images in _iter_method_dirs(TEST_FOLDER):
+            mod = _load_method(wm_method)
             if mod is None:
                 continue
 
-            recon_dir = os.path.join(OUT_DIR, method_name)
-            os.makedirs(recon_dir, exist_ok=True)
-
-            stats = _MethodStats()
-            all_stats[method_name] = stats
-
             for img_path in images:
                 filename = img_path.name
-                row = {f: "" for f in FIELDS}
-                row["image"]  = filename
-                row["method"] = method_name
+                print(f"\n[{wm_method}] {filename}")
 
-                wm_detected = attacked_detected = None
+                # Load original tensor once; reused across all removal methods and scales.
+                wm_t = _to_tensor(Image.open(img_path))
 
-                print(f"\n[{method_name}] {filename}")
-
+                # ── 1. Verify watermark on the input image (once per image) ──
+                wm_detected = None
                 try:
-                    # ── 1. Verify watermark on the input image ────────────────
                     verify_wm   = mod.verify_watermark(str(img_path))
                     wm_detected = _get_detected(verify_wm)
-                    row["wm_detected"] = wm_detected
                     print(f"  wm verify  : {verify_wm}")
-
-                    # ── 2. Attack: remove watermark ───────────────────────────
-                    recon_path = remove_watermark(str(img_path), out_dir=recon_dir)
-
-                    # ── 3. Verify watermark on reconstruction ─────────────────
-                    verify_atk      = mod.verify_watermark(recon_path)
-                    attacked_detected = _get_detected(verify_atk)
-                    row["attacked_detected"] = attacked_detected
-                    print(f"  atk verify : {verify_atk}")
-
-                    # ── 4. PSNR / SSIM (watermarked vs reconstruction) ────────
-                    wm_t, recon_t  = _load_metric_pair(str(img_path), recon_path)
-                    row["psnr"]    = round(_psnr(wm_t, recon_t), 4)
-                    row["ssim"]    = round(_ssim(wm_t, recon_t), 4)
-                    print(f"  PSNR={row['psnr']} dB  SSIM={row['ssim']}")
-
                 except Exception:
-                    err = traceback.format_exc(limit=3)
-                    row["error"] = err.replace("\n", " | ")
-                    print(f"  ERROR: {err}")
+                    print(f"  wm verify ERROR: {traceback.format_exc(limit=2)}")
 
-                stats.update(wm_detected, attacked_detected,
-                             row["psnr"], row["ssim"])
-                writer.writerow(row)
-                csv_file.flush()
+                # ── 2–4. For each removal method × scale: attack + verify + metrics ──
+                for removal_name in REMOVAL_METHODS:
+                    remove_wm = _load_removal_method(removal_name)
+                    if remove_wm is None:
+                        continue
+
+                    for scale in ATTACK_SCALES:
+                        key = (removal_name, wm_method, scale)
+                        if key not in all_stats:
+                            all_stats[key] = _MethodStats()
+                        stats = all_stats[key]
+
+                        recon_dir = os.path.join(OUT_DIR, removal_name, wm_method, f"scale_{scale}")
+                        os.makedirs(recon_dir, exist_ok=True)
+
+                        if os.path.exists(os.path.join(recon_dir, filename)):
+                            print(f"  [{removal_name}] scale={scale}  skip (output exists)")
+                            continue
+
+                        row = {f: "" for f in FIELDS}
+                        row["removal_method"] = removal_name
+                        row["image"]          = filename
+                        row["wm_method"]      = wm_method
+                        row["scale"]          = scale
+                        row["wm_detected"]    = wm_detected
+                        attacked_detected     = None
+
+                        try:
+                            recon_path = remove_wm(str(img_path),
+                                                    out_dir=recon_dir,
+                                                    scale=scale)
+
+                            # Overlap verify (CPU) with loading the recon tensor (disk I/O).
+                            def _load_recon(p):
+                                t = _to_tensor(Image.open(p).convert("RGB"))
+                                if wm_t.shape[-2:] != t.shape[-2:]:
+                                    t = F.interpolate(t, size=wm_t.shape[-2:],
+                                                      mode="bilinear", align_corners=False,
+                                                      antialias=True)
+                                return t
+
+                            with ThreadPoolExecutor(max_workers=2) as tex:
+                                fut_verify = tex.submit(mod.verify_watermark, recon_path)
+                                fut_recon  = tex.submit(_load_recon, recon_path)
+                                verify_atk = fut_verify.result()
+                                recon_t    = fut_recon.result()
+
+                            attacked_detected = _get_detected(verify_atk)
+                            row["attacked_detected"] = attacked_detected
+                            print(f"  [{removal_name}] scale={scale}  atk verify : {verify_atk}")
+
+                            row["psnr"]   = round(_metrics.psnr(wm_t, recon_t), 4)
+                            row["ssim"]   = round(_metrics.ssim(wm_t, recon_t), 4)
+                            row["lpips"]  = round(_metrics.lpips(wm_t, recon_t), 4)
+                            print(f"  [{removal_name}] scale={scale}  PSNR={row['psnr']} dB  "
+                                  f"SSIM={row['ssim']}  LPIPS={row['lpips']}")
+
+                        except Exception:
+                            err = traceback.format_exc(limit=3)
+                            row["error"] = err.replace("\n", " | ")
+                            print(f"  [{removal_name}] scale={scale}  ERROR: {err}")
+
+                        stats.update(wm_detected, attacked_detected,
+                                     row["psnr"], row["ssim"], row["lpips"])
+                        writer.writerow(row)
+                        csv_file.flush()
 
     finally:
         csv_file.close()
 
-    # ── Per-method accuracy summary ───────────────────────────────────────────
-    summary_rows = [s.summary(m) for m, s in all_stats.items()]
+    # ── Summary ───────────────────────────────────────────────────────────────
+    summary_rows = [s.summary(rm, wm, sc)
+                    for (rm, wm, sc), s in sorted(all_stats.items())]
 
     with open(SUMMARY_CSV, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=SUMMARY_FIELDS)
         w.writeheader()
         w.writerows(summary_rows)
 
-    print(f"\n{'method':<22} {'total':>6} {'wm_acc':>8} {'atk_acc':>8} {'avg_psnr':>10} {'avg_ssim':>9}")
-    print("-" * 70)
+    print(f"\n{'removal':<20} {'wm_method':<18} {'scale':>6} {'total':>6} "
+          f"{'wm_acc':>8} {'atk_acc':>8} {'avg_psnr':>10} {'avg_ssim':>9} {'avg_lpips':>10}")
+    print("-" * 100)
     for r in summary_rows:
-        print(f"{r['method']:<22} {r['total']:>6} {str(r['wm_accuracy']):>8} "
-              f"{str(r['attacked_accuracy']):>8} {str(r['avg_psnr']):>10} {str(r['avg_ssim']):>9}")
+        print(f"{r['removal_method']:<20} {r['wm_method']:<18} {str(r['scale']):>6} {r['total']:>6} "
+              f"{str(r['wm_accuracy']):>8} {str(r['attacked_accuracy']):>8} "
+              f"{str(r['avg_psnr']):>10} {str(r['avg_ssim']):>9} {str(r['avg_lpips']):>10}")
 
     print(f"\nPer-image results : {CSV_PATH}")
     print(f"Summary           : {SUMMARY_CSV}")
