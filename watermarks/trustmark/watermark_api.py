@@ -19,43 +19,57 @@ class _TrustMarkRedirect:
         return self if name.startswith('trustmark.') else None
 
     def load_module(self, name):
-        if name in sys.modules:
-            return sys.modules[name]
         suffix = name[len('trustmark.'):]          # e.g. 'model' or 'unet'
         reg = _PKG_NAME + '.' + suffix             # '_trustmark_pkg.model'
-        if reg not in sys.modules:
-            parts = suffix.split('.')
-            p = os.path.join(_PKG_DIR, *parts)
-            init = os.path.join(p, '__init__.py')
-            if os.path.isdir(p) and os.path.exists(init):
-                spec = importlib.util.spec_from_file_location(
-                    reg, init, submodule_search_locations=[p]
-                )
-                mod = importlib.util.module_from_spec(spec)
-                mod.__package__ = reg
-                sys.modules[reg] = mod
-                sys.modules[name] = mod
-                spec.loader.exec_module(mod)
-            elif os.path.isdir(p):
-                # Directory with no __init__.py — treat as namespace package
-                spec = importlib.machinery.ModuleSpec(reg, None, is_package=True)
-                spec.submodule_search_locations = [p]
-                mod = importlib.util.module_from_spec(spec)
-                mod.__package__ = reg
-                sys.modules[reg] = mod
-                sys.modules[name] = mod
-            else:
-                spec = importlib.util.spec_from_file_location(reg, p + '.py')
-                if spec is None:
-                    raise ImportError(f'Cannot find {name!r} in {_PKG_DIR}')
-                mod = importlib.util.module_from_spec(spec)
-                mod.__package__ = (_PKG_NAME + '.' + '.'.join(parts[:-1])
-                                   if len(parts) > 1 else _PKG_NAME)
-                sys.modules[reg] = mod
-                sys.modules[name] = mod
-                spec.loader.exec_module(mod)
-        else:
+        # Check the private-namespaced copy first — it only exists if our
+        # redirect successfully loaded it, so it's safe to reuse.  We do NOT
+        # check sys.modules[name] here: that entry may be a partial stub from a
+        # previous failed exec_module (e.g. missing torchmetrics on first run),
+        # which would cause "module has no attribute 'TrustMark_Arch'".
+        if reg in sys.modules:
             sys.modules[name] = sys.modules[reg]
+            return sys.modules[name]
+
+        parts = suffix.split('.')
+        p = os.path.join(_PKG_DIR, *parts)
+        init = os.path.join(p, '__init__.py')
+        if os.path.isdir(p) and os.path.exists(init):
+            spec = importlib.util.spec_from_file_location(
+                reg, init, submodule_search_locations=[p]
+            )
+            mod = importlib.util.module_from_spec(spec)
+            mod.__package__ = reg
+            sys.modules[reg] = mod
+            sys.modules[name] = mod
+            try:
+                spec.loader.exec_module(mod)
+            except Exception:
+                sys.modules.pop(reg, None)
+                sys.modules.pop(name, None)
+                raise
+        elif os.path.isdir(p):
+            # Directory with no __init__.py — treat as namespace package
+            spec = importlib.machinery.ModuleSpec(reg, None, is_package=True)
+            spec.submodule_search_locations = [p]
+            mod = importlib.util.module_from_spec(spec)
+            mod.__package__ = reg
+            sys.modules[reg] = mod
+            sys.modules[name] = mod
+        else:
+            spec = importlib.util.spec_from_file_location(reg, p + '.py')
+            if spec is None:
+                raise ImportError(f'Cannot find {name!r} in {_PKG_DIR}')
+            mod = importlib.util.module_from_spec(spec)
+            mod.__package__ = (_PKG_NAME + '.' + '.'.join(parts[:-1])
+                               if len(parts) > 1 else _PKG_NAME)
+            sys.modules[reg] = mod
+            sys.modules[name] = mod
+            try:
+                spec.loader.exec_module(mod)
+            except Exception:
+                sys.modules.pop(reg, None)
+                sys.modules.pop(name, None)
+                raise
         return sys.modules[name]
 
 
@@ -71,7 +85,11 @@ if _PKG_NAME not in sys.modules:
     )
     _pkg = importlib.util.module_from_spec(_pkg_spec)
     sys.modules[_PKG_NAME] = _pkg
-    _pkg_spec.loader.exec_module(_pkg)
+    try:
+        _pkg_spec.loader.exec_module(_pkg)
+    except Exception:
+        sys.modules.pop(_PKG_NAME, None)
+        raise
 
 TrustMark = sys.modules[_PKG_NAME].TrustMark
 
