@@ -1,5 +1,8 @@
 """
-eval.py — Watermark removal evaluation.
+eval.py — Unified watermark-removal evaluation.
+
+Runs the same evaluation pipeline against any registered removal *attack*
+(COMPAT / NFPA / ...) through a single function, ``run_evaluation(attack=...)``.
 
 TEST_FOLDER layout (images are already watermarked):
 
@@ -11,23 +14,39 @@ TEST_FOLDER layout (images are already watermarked):
             img1.jpg
         ...
 
-For every method sub-directory and every image inside it:
-  1. Verify watermark              → wm_detected
-  2. Attack: remove watermark      → <OUT_DIR>/<method>/<filename>
-  3. Verify on reconstruction      → attacked_detected
-  4. Compute PSNR / SSIM          (watermarked vs reconstruction)
+The sub-directory name must match a watermark method package under ``watermarks/``
+(e.g. ``dwt_dct``, ``ssl_watermarking``, ``trustmark``, ``watermark_anything``,
+``vine``, ``editguard``, ``omniguard``).
 
-Results are written row-by-row to CSV_PATH so partial runs are preserved.
+For every method sub-directory and every image inside it:
+  1. Verify watermark                       → wm_detected
+  2. Attack: remove watermark               → <OUT_DIR>/<method>/<filename>
+  3. Verify watermark on reconstruction      → attacked_detected
+  4. Compute PSNR / SSIM                     (watermarked vs reconstruction)
+
+Results are written row-by-row to a CSV so partial runs are preserved, plus a
+per-method accuracy summary.
 
 Usage:
-    python eval.py
+    python eval.py --attack compat           # Flux2Klein removal (default)
+    python eval.py --attack nfpa             # Next-Frame Prediction attack
+    python eval.py --attack compat_sr        # Swin2SR + FluxVAE removal
+    python eval.py --attack nfpa --steps 10 --xy 40
+    python eval.py --attack compat --test-folder my_data --out-dir my_out
+
+    # Or from Python:
+    from eval import run_evaluation
+    run_evaluation(attack="nfpa")
+
+Set SKIP_REMOVAL=1 (or --skip-removal) to dry-run without loading any attack model.
 """
 
 import os
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+import argparse
 import csv
 import importlib
 import sys
@@ -55,6 +74,62 @@ CSV_PATH        = "eval_results.csv" # results table
 ATTACK_SCALES   = [0.25, 0.5]        # downsample scales to evaluate
 REMOVAL_METHODS = ["compat_flux_v2"]    # module names to import remove_watermark from
 
+# ── Attack registry ───────────────────────────────────────────────────────────
+# name -> (module_name, attribute) for the removal function.  Modules are imported
+# lazily so only the selected attack's heavy model is loaded.
+#
+# Every removal function has the signature
+#     remove_watermark(image_path, out_dir="recon", **attack_kwargs) -> out_path
+ATTACKS = {
+    "compat":    ("compat_flux", "remove_watermark"),  # Flux2Klein diffusion removal
+    "nfpa":      ("nfpa",        "remove_watermark"),  # Next-Frame Prediction attack
+    "compat_sr": ("compat",      "remove_watermark"),  # Swin2SR + FluxVAE (no diffusion)
+}
+
+# Convenient aliases.
+_ALIASES = {
+    "flux": "compat",
+    "compat_flux": "compat",
+    "nfp": "nfpa",
+}
+
+
+def list_attacks():
+    """Return the list of registered attack names."""
+    return list(ATTACKS.keys())
+
+
+def _resolve_attack_name(name):
+    key = name.lower()
+    key = _ALIASES.get(key, key)
+    if key not in ATTACKS:
+        raise ValueError(
+            f"Unknown attack {name!r}. Available: {', '.join(ATTACKS)}"
+        )
+    return key
+
+
+def load_remover(attack, skip_removal=False):
+    """
+    Return the ``remove_watermark`` callable for the named attack.
+
+    With ``skip_removal=True`` (or env SKIP_REMOVAL=1) returns a stub that raises
+    NotImplementedError, so the rest of the pipeline can be exercised without
+    loading any heavy model.
+    """
+    if skip_removal or os.environ.get("SKIP_REMOVAL") == "1":
+        def _stub(image_path, out_dir="recon", **kwargs):
+            raise NotImplementedError("SKIP_REMOVAL mode — removal disabled")
+        return _stub
+
+    key = _resolve_attack_name(attack)
+    mod_name, attr = ATTACKS[key]
+    mod = importlib.import_module(mod_name)
+    return getattr(mod, attr)
+
+
+# ── Config defaults ───────────────────────────────────────────────────────────
+TEST_FOLDER = "test_folder"      # root containing <method>/<images> sub-dirs
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 
 # ── CSV schema ────────────────────────────────────────────────────────────────
@@ -71,7 +146,6 @@ FIELDS = [
     "error",            # non-empty if any step raised an exception
 ]
 
-SUMMARY_CSV   = "eval_summary.csv"
 SUMMARY_FIELDS = [
     "removal_method",
     "wm_method",
@@ -94,6 +168,8 @@ _metrics = MetricEvaluator()
 def _iter_method_dirs(root):
     """Yield (method_name, sorted list of image Paths) for each sub-dir of root."""
     root = Path(root)
+    if not root.exists():
+        raise FileNotFoundError(f"TEST_FOLDER not found: {root.resolve()}")
     for d in sorted(root.iterdir()):
         if not d.is_dir():
             continue
@@ -115,9 +191,8 @@ def _get_detected(result: dict):
     Returns None for methods that do not report a detection decision
     (e.g. watermark_anything, which only returns decoded bits).
     """
-    if "detected" in result:
+    if isinstance(result, dict) and "detected" in result:
         return bool(result["detected"])
-    # watermark_anything returns message/message_list — no detection threshold
     return None
 
 
@@ -192,14 +267,45 @@ class _MethodStats:
         }
 
 
-# ── Main evaluation loop ──────────────────────────────────────────────────────
+# ── Main evaluation entry point ───────────────────────────────────────────────
 
-def main():
-    os.makedirs(OUT_DIR, exist_ok=True)
+def run_evaluation(attack="compat", test_folder=TEST_FOLDER, out_dir=None,
+                   csv_path=None, summary_csv=None, attack_kwargs=None,
+                   skip_removal=False):
+    """
+    Run the watermark-removal evaluation for a single attack method.
+
+    Args:
+        attack:        registered attack name (see ``list_attacks()``):
+                       'compat' (Flux2Klein), 'nfpa' (Next-Frame Prediction),
+                       'compat_sr' (Swin2SR + FluxVAE).
+        test_folder:   root containing <method>/<images> sub-directories.
+        out_dir:       where reconstructions are written
+                       (default ``eval_<attack>_out``).
+        csv_path:      per-image results CSV (default ``eval_<attack>_results.csv``).
+        summary_csv:   per-method summary CSV (default ``eval_<attack>_summary.csv``).
+        attack_kwargs: dict of extra kwargs forwarded to the removal function
+                       (e.g. {'scale': 0.25} for compat, {'num_inference_steps': 10,
+                       'xy': 40} for nfpa).
+        skip_removal:  if True, do not load/run the attack model (dry run).
+
+    Returns:
+        list of per-method summary dicts.
+    """
+    attack = _resolve_attack_name(attack)
+    attack_kwargs = dict(attack_kwargs or {})
+
+    out_dir     = out_dir     or f"eval_{attack}_out"
+    csv_path    = csv_path    or f"eval_{attack}_results.csv"
+    summary_csv = summary_csv or f"eval_{attack}_summary.csv"
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    remove_watermark = load_remover(attack, skip_removal=skip_removal)
 
     # Per-image CSV — append mode so partial runs are preserved.
-    csv_exists = os.path.exists(CSV_PATH)
-    csv_file   = open(CSV_PATH, "a", newline="")
+    csv_exists = os.path.exists(csv_path)
+    csv_file   = open(csv_path, "a", newline="")
     writer     = csv.DictWriter(csv_file, fieldnames=FIELDS)
     if not csv_exists:
         writer.writeheader()
@@ -302,7 +408,7 @@ def main():
     summary_rows = [s.summary(rm, wm, sc)
                     for (rm, wm, sc), s in sorted(all_stats.items())]
 
-    with open(SUMMARY_CSV, "w", newline="") as f:
+    with open(summary_csv, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=SUMMARY_FIELDS)
         w.writeheader()
         w.writerows(summary_rows)
@@ -315,8 +421,74 @@ def main():
               f"{str(r['wm_accuracy']):>8} {str(r['attacked_accuracy']):>8} "
               f"{str(r['avg_psnr']):>10} {str(r['avg_ssim']):>9} {str(r['avg_lpips']):>10}")
 
-    print(f"\nPer-image results : {CSV_PATH}")
-    print(f"Summary           : {SUMMARY_CSV}")
+    print(f"\nPer-image results : {csv_path}")
+    print(f"Summary           : {summary_csv}")
+    return summary_rows
+
+
+# ── CLI ────────────────────────────────────────────────────────────────────────
+
+def _parse_attack_kwargs(args):
+    """Build the attack_kwargs dict from the relevant CLI options."""
+    kwargs = {}
+    if args.scale is not None:
+        kwargs["scale"] = args.scale
+    if args.steps is not None:
+        kwargs["num_inference_steps"] = args.steps
+    if args.xy is not None:
+        kwargs["xy"] = args.xy
+    for item in (args.attack_arg or []):
+        if "=" not in item:
+            raise ValueError(f"--attack-arg must be key=value, got {item!r}")
+        k, v = item.split("=", 1)
+        # best-effort type coercion
+        try:
+            v = int(v)
+        except ValueError:
+            try:
+                v = float(v)
+            except ValueError:
+                pass
+        kwargs[k] = v
+    return kwargs
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Unified watermark-removal evaluation (COMPAT / NFPA / ...).")
+    parser.add_argument("--attack", default="compat",
+                        help=f"removal attack: {', '.join(list_attacks())} (default: compat)")
+    parser.add_argument("--test-folder", default=TEST_FOLDER,
+                        help="root with <method>/<images> sub-dirs (default: test_folder)")
+    parser.add_argument("--out-dir", default=None,
+                        help="output dir for reconstructions (default: eval_<attack>_out)")
+    parser.add_argument("--csv", default=None,
+                        help="per-image results CSV (default: eval_<attack>_results.csv)")
+    parser.add_argument("--summary", default=None,
+                        help="per-method summary CSV (default: eval_<attack>_summary.csv)")
+    parser.add_argument("--skip-removal", action="store_true",
+                        help="dry run: do not load/run any attack model")
+    # Attack hyper-parameters (only the relevant ones are forwarded).
+    parser.add_argument("--scale", type=float, default=None,
+                        help="[compat/compat_sr] downsample factor (default 0.25)")
+    parser.add_argument("--steps", type=int, default=None,
+                        help="[nfpa] DDIM inversion/denoising steps (default 10)")
+    parser.add_argument("--xy", type=int, default=None,
+                        help="[nfpa] motion-field warp range (default 40)")
+    parser.add_argument("--attack-arg", action="append", default=None,
+                        metavar="KEY=VALUE",
+                        help="extra kwarg forwarded to the removal function (repeatable)")
+    args = parser.parse_args()
+
+    run_evaluation(
+        attack=args.attack,
+        test_folder=args.test_folder,
+        out_dir=args.out_dir,
+        csv_path=args.csv,
+        summary_csv=args.summary,
+        attack_kwargs=_parse_attack_kwargs(args),
+        skip_removal=args.skip_removal,
+    )
 
 
 if __name__ == "__main__":

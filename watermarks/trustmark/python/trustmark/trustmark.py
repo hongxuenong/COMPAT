@@ -139,16 +139,11 @@ class TrustMark():
             return self.secret_len
 
     def check_and_download(self, filename):
-        valid=False
-        if os.path.isfile(filename) and os.path.getsize(filename)>0:
-            with open(filename) as file, mmap(file.fileno(), 0, access=ACCESS_READ) as file:
-                 valid= (MODEL_CHECKSUMS[pathlib.Path(filename).name]==md5(file).hexdigest())
-
-        if not valid:
-            print('Fetching model file (once only): '+filename)
-            urld=MODEL_REMOTE_HOST+os.path.basename(filename)
- 
-            urllib.request.urlretrieve(urld, filename=filename)
+        if os.path.isfile(filename) and os.path.getsize(filename) > 0:
+            return
+        print('Fetching model file (once only): '+filename)
+        urld=MODEL_REMOTE_HOST+os.path.basename(filename)
+        urllib.request.urlretrieve(urld, filename=filename)
 
     def load_model(self, config_path, weight_path, device, secret_len, part='all'):
         assert part in ['all', 'encoder', 'decoder', 'remover', 'detector']
