@@ -37,7 +37,6 @@ for _p in (_WM_DIR, _ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import torch
 from compat import COMPAT
 from metric import MetricEvaluator
 
@@ -85,33 +84,6 @@ SUMMARY_FIELDS = [
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 _metrics = MetricEvaluator()
-
-_CLIP_MODEL_PATH = os.environ.get("COMPAT_CLIP_MODEL", "openai/clip-vit-base-patch32")
-
-class _CLIPScorer:
-    """Lazy-loaded CLIP image-image cosine similarity scorer."""
-    def __init__(self):
-        from transformers import CLIPModel, CLIPProcessor
-        self._model = CLIPModel.from_pretrained(_CLIP_MODEL_PATH).eval()
-        self._processor = CLIPProcessor.from_pretrained(_CLIP_MODEL_PATH)
-        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self._model.to(self._device)
-
-    @torch.no_grad()
-    def score(self, img1: Image.Image, img2: Image.Image) -> float:
-        inputs = self._processor(images=[img1, img2], return_tensors="pt")
-        inputs = {k: v.to(self._device) for k, v in inputs.items()}
-        feats = self._model.get_image_features(**inputs)
-        feats = feats / feats.norm(dim=-1, keepdim=True)
-        return float(feats[0] @ feats[1])
-
-_clip_scorer = None
-
-def _clip_score(img1: Image.Image, img2: Image.Image) -> float:
-    global _clip_scorer
-    if _clip_scorer is None:
-        _clip_scorer = _CLIPScorer()
-    return _clip_scorer.score(img1, img2)
 
 
 def _iter_method_dirs(root):
@@ -277,9 +249,10 @@ def run_ablation(test_folder=TEST_FOLDER, out_dir="ablation_out", n_samples=None
                         psnr  = round(_metrics.psnr(wm_t,  recon_t), 4)
                         ssim  = round(_metrics.ssim(wm_t,  recon_t), 4)
                         lpips = round(_metrics.lpips(wm_t, recon_t), 4)
-                        clip  = round(_clip_score(Image.open(img_path), Image.open(out_path)), 4)
+                        clip  = round(_metrics.clip_score(wm_t, recon_t), 4)
+                        ba_str = f"{atk_ba:.3f}" if atk_ba != "" else "n/a"
                         print(f"  [{wm_method}] {filename}: "
-                              f"atk_det={atk_detected} ba={atk_ba:.3f} "
+                              f"atk_det={atk_detected} ba={ba_str} "
                               f"PSNR={psnr} SSIM={ssim} LPIPS={lpips} CLIP={clip}")
 
                     except Exception:
