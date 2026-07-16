@@ -3,6 +3,7 @@ import os
 import sys
 
 from PIL import Image
+import math,random
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _PKG_DIR = os.path.join(_DIR, 'python', 'trustmark')
@@ -91,50 +92,74 @@ if _PKG_NAME not in sys.modules:
         sys.modules.pop(_PKG_NAME, None)
         raise
 
-TrustMark = sys.modules[_PKG_NAME].TrustMark
 
 _DEFAULT_SECRET = 'watermark'
 _DEFAULT_MODEL = 'Q'
 
+class Watermark():
+    def __init__(self):
+        self.DETECTFIRST = False
+        self.model = sys.modules[_PKG_NAME].TrustMark(verbose=True, 
+                                                      model_type=_DEFAULT_MODEL,
+                                                      encoding_type=sys.modules[_PKG_NAME].TrustMark.Encoding.BCH_5, 
+                                                      loadBBoxDetector=self.DETECTFIRST)
+        # self.bitstring = '10100100010001110001010100100101'
+        random.seed(1234)
+        capacity=self.model.schemaCapacity()
+        self.bitstring = bitstring=''.join([random.choice(['0', '1']) for _ in range(capacity)])
+        
+    
+    def add_watermark(self,image_path, output_path=None, secret=_DEFAULT_SECRET, model_type=_DEFAULT_MODEL):
+        """
+        Embed a text watermark using TrustMark.
 
-def add_watermark(image_path, output_path=None, secret=_DEFAULT_SECRET, model_type=_DEFAULT_MODEL):
-    """
-    Embed a text watermark using TrustMark.
+        Args:
+            image_path: Path to the input image (any resolution).
+            output_path: Save path. Defaults to <stem>_watermarked<ext>.
+            secret: ASCII string to embed (max ~7 chars for default ECC).
+            model_type: 'Q' (balanced), 'P' (quality), 'B' (base), or 'C' (compact).
 
-    Args:
-        image_path: Path to the input image (any resolution).
-        output_path: Save path. Defaults to <stem>_watermarked<ext>.
-        secret: ASCII string to embed (max ~7 chars for default ECC).
-        model_type: 'Q' (balanced), 'P' (quality), 'B' (base), or 'C' (compact).
+        Returns:
+            output_path (str)
+        """
+        image_path = os.path.abspath(image_path)
+        if output_path is None:
+            stem, ext = os.path.splitext(image_path)
+            output_path = f"{stem}_watermarked{ext or '.png'}"
 
-    Returns:
-        output_path (str)
-    """
-    image_path = os.path.abspath(image_path)
-    if output_path is None:
-        stem, ext = os.path.splitext(image_path)
-        output_path = f"{stem}_watermarked{ext or '.png'}"
-
-    tm = TrustMark(verbose=False, model_type=model_type)
-    img = Image.open(image_path).convert('RGB')
-    wm_img = tm.encode(img, secret, MODE='text')
-    wm_img.save(output_path)
-    return output_path
+        # tm = self.model(verbose=False, model_type=model_type)
+        img = Image.open(image_path).convert('RGB')
+        # wm_img = self.model.encode(img, secret, MODE='text')
+        wm_img = self.model.encode(img, self.bitstring, MODE='binary')
+        wm_img.save(output_path)
+        return output_path
 
 
-def verify_watermark(image_path, model_type=_DEFAULT_MODEL):
-    """
-    Decode and verify a TrustMark watermark.
+    def verify_watermark(self,image_path, model_type=_DEFAULT_MODEL):
+        """
+        Decode and verify a TrustMark watermark.
 
-    Returns:
-        dict with keys:
-            - detected (bool): True if a watermark is present.
-            - message (str): Decoded secret string.
-    """
-    tm = TrustMark(verbose=False, model_type=model_type)
-    img = Image.open(os.path.abspath(image_path)).convert('RGB')
-    secret, present, _ = tm.decode(img, MODE='text')
-    return {
-        'detected': bool(present),
-        'message': secret,
-    }
+        Returns:
+            dict with keys:
+                - detected (bool): True if a watermark is present.
+                - message (str): Decoded secret string.
+        """
+        img = Image.open(os.path.abspath(image_path)).convert('RGB')
+        secret, present, _ = self.model.decode(img, MODE='binary', DETECTFIRST=self.DETECTFIRST, ROTATION=False)
+
+        n = min(len(secret), len(self.bitstring))
+        bit_accuracy = sum(a == b for a, b in zip(secret, self.bitstring)) / n if n else 0.0
+
+        return {
+            'detected': bool(present) and bit_accuracy>0.57377,
+            'bit_accuracy': bit_accuracy,
+            'message': secret,
+        }
+
+if __name__ == "__main__":
+    image_path = '/data/xuenong_hong/projects/COMPAT/recon_v2/000000272049.jpg'
+    tm = Watermark()
+    tm.add_watermark(image_path)
+    result = tm.verify_watermark('/data/xuenong_hong/projects/COMPAT/recon_v2/000000272049_watermarked.jpg')
+    print(result)
+    

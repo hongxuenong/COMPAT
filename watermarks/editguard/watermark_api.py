@@ -353,3 +353,16 @@ def verify_watermark(image_path, ckpt_path=None, message=None):
         'detected': bit_accuracy >= 0.95,
         'mask_path': mask_path,
     }
+
+
+class Watermark:
+    def __init__(self, message=None, ckpt_path=None):
+        self._message = message or _default_message()
+        self._ckpt_path = ckpt_path
+        _load_model(ckpt_path)  # eager-load into cache
+
+    def add_watermark(self, image_path, output_path=None):
+        return add_watermark(image_path, output_path, self._message, self._ckpt_path)
+
+    def verify_watermark(self, image_path):
+        return verify_watermark(image_path, self._ckpt_path, self._message)

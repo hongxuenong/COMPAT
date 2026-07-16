@@ -79,32 +79,17 @@ for _p in (_ATK_DIR, _ROOT):
 # Every removal function has the signature
 #     remove_watermark(image_path, out_dir="recon", **attack_kwargs) -> out_path
 ATTACKS = {
-    "compat":    ("compat_flux", "remove_watermark"),  # Flux2Klein diffusion removal
     "nfpa":      ("nfpa",        "remove_watermark"),  # Next-Frame Prediction attack
-    "compat_sr": ("compat",      "remove_watermark"),  # Swin2SR + FluxVAE (no diffusion)
+    "da": ("WatermarkAttacker",        "remove_watermark_diffusion"),
+    "va": ("WatermarkAttacker",        "remove_watermark_vae")
 }
 
-# Convenient aliases.
-_ALIASES = {
-    "flux": "compat",
-    "compat_flux": "compat",
-    "nfp": "nfpa",
-}
 
 
 def list_attacks():
     """Return the list of registered attack names."""
     return list(ATTACKS.keys())
 
-
-def _resolve_attack_name(name):
-    key = name.lower()
-    key = _ALIASES.get(key, key)
-    if key not in ATTACKS:
-        raise ValueError(
-            f"Unknown attack {name!r}. Available: {', '.join(ATTACKS)}"
-        )
-    return key
 
 
 def load_remover(attack, skip_removal=False):
@@ -120,8 +105,7 @@ def load_remover(attack, skip_removal=False):
             raise NotImplementedError("SKIP_REMOVAL mode — removal disabled")
         return _stub
 
-    key = _resolve_attack_name(attack)
-    mod_name, attr = ATTACKS[key]
+    mod_name, attr = ATTACKS[attack]
     mod = importlib.import_module(mod_name)
     return getattr(mod, attr)
 
@@ -282,7 +266,6 @@ def run_evaluation(attack="compat", test_folder=TEST_FOLDER, out_dir=None,
     Returns:
         list of per-method summary dicts.
     """
-    attack = _resolve_attack_name(attack)
     attack_kwargs = dict(attack_kwargs or {})
 
     out_dir     = out_dir     or f"out/eval_{attack}_out"
@@ -337,16 +320,12 @@ def run_evaluation(attack="compat", test_folder=TEST_FOLDER, out_dir=None,
 
                 print(f"\n[{attack}] [{method_name}] {filename}")
 
-                recon_path = os.path.join(recon_dir, filename)
-                if os.path.exists(recon_path):
-                    print(f"  [{attack}] skip (output exists)")
-                    continue
-
                 try:
                     # ── 1. Verify watermark on the input image ────────────────
                     verify_wm   = wm.verify_watermark(str(img_path))
                     wm_detected = _get_detected(verify_wm)
                     row["wm_detected"] = wm_detected
+                    # row["wm_key_accurate"] = verify_wm['key_accuracy']
                     print(f"  wm verify  : {verify_wm}")
 
                     # ── 2. Attack: remove watermark ───────────────────────────
@@ -357,6 +336,7 @@ def run_evaluation(attack="compat", test_folder=TEST_FOLDER, out_dir=None,
                     verify_atk        = wm.verify_watermark(recon_path)
                     attacked_detected = _get_detected(verify_atk)
                     row["attacked_detected"] = attacked_detected
+                    # row["attacked_key_accurate"] = verify_atk['key_accuracy']
                     print(f"  atk verify : {verify_atk}")
 
                     # ── 4. PSNR / SSIM (watermarked vs reconstruction) ────────
@@ -399,5 +379,7 @@ def run_evaluation(attack="compat", test_folder=TEST_FOLDER, out_dir=None,
     return summary_rows
 
 if __name__ == "__main__":
-    run_evaluation(attack="nfpa", 
+    run_evaluation(attack="da", 
+                   test_folder='/data/xuenong_hong/dataset/aigc/watermark_benchmark/watermarked')
+    run_evaluation(attack="va", 
                    test_folder='/data/xuenong_hong/dataset/aigc/watermark_benchmark/watermarked')

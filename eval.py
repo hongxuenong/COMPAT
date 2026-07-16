@@ -1,9 +1,6 @@
 """
 eval.py — Unified watermark-removal evaluation.
 
-Runs the same evaluation pipeline against any registered removal *attack*
-(COMPAT / NFPA / ...) through a single function, ``run_evaluation(attack=...)``.
-
 TEST_FOLDER layout (images are already watermarked):
 
     test_folder/
@@ -14,31 +11,28 @@ TEST_FOLDER layout (images are already watermarked):
             img1.jpg
         ...
 
-The sub-directory name must match a watermark method package under ``watermarks/``
-(e.g. ``dwt_dct``, ``ssl_watermarking``, ``trustmark``, ``watermark_anything``,
-``vine``, ``editguard``, ``omniguard``).
+The sub-directory name must match a watermark method package under ``watermarks/``.
 
 For every method sub-directory and every image inside it:
   1. Verify watermark                       → wm_detected
-  2. Attack: remove watermark               → <OUT_DIR>/<method>/<filename>
-  3. Verify watermark on reconstruction      → attacked_detected
-  4. Compute PSNR / SSIM                     (watermarked vs reconstruction)
+  2. Attack: remove watermark               → <out_dir>/<wm_method>/scale_<s>/<file>
+  3. Verify watermark on reconstruction     → attacked_detected
+  4. Compute PSNR / SSIM / LPIPS            (watermarked vs reconstruction)
 
-Results are written row-by-row to a CSV so partial runs are preserved, plus a
-per-method accuracy summary.
+Results are written row-by-row to a CSV so partial runs are preserved.
 
 Usage:
     python eval.py --attack compat           # Flux2Klein removal (default)
-    python eval.py --attack nfpa             # Next-Frame Prediction attack
-    python eval.py --attack compat_sr        # Swin2SR + FluxVAE removal
-    python eval.py --attack nfpa --steps 10 --xy 40
+    python eval.py --attack compat_flux_v2   # Flux2Klein v2
+    python eval.py --attack diffusion        # SD3 diffusion removal
+    python eval.py --attack compat --scale 0.5
     python eval.py --attack compat --test-folder my_data --out-dir my_out
 
     # Or from Python:
     from eval import run_evaluation
-    run_evaluation(attack="nfpa")
+    run_evaluation(attack="compat")
 
-Set SKIP_REMOVAL=1 (or --skip-removal) to dry-run without loading any attack model.
+Set SKIP_REMOVAL=1 to dry-run without loading any attack model.
 """
 
 import os
@@ -62,40 +56,32 @@ from PIL import Image
 # ── Project paths ─────────────────────────────────────────────────────────────
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 
-# Make watermark sub-packages importable as top-level names (dwt_dct, vine, ...)
 _WM_DIR = os.path.join(_ROOT, "watermarks")
 if _WM_DIR not in sys.path:
     sys.path.insert(0, _WM_DIR)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-TEST_FOLDER     = "test_folder"      # root containing <wm_method>/<images> sub-dirs
-OUT_DIR         = "eval_out"         # root: OUT_DIR/<removal_method>/<wm_method>/scale_*/
-CSV_PATH        = "eval_results.csv" # results table
-ATTACK_SCALES   = [0.25, 0.5]        # downsample scales to evaluate
-REMOVAL_METHODS = ["compat_flux_v2"]    # module names to import remove_watermark from
+# TEST_FOLDER   = "/data/xuenong_hong/dataset/aigc/watermark_benchmark/watermarked"      # root containing <wm_method>/<images> sub-dirs
+# TEST_FOLDER   = "/data/xuenong_hong/dataset/aigc/watermark_benchmark/watermarked"      # root containing <wm_method>/<images> sub-dirs
+TEST_FOLDER   = "/data/xuenong_hong/dataset/aigc/watermark_benchmark/watermark_1FAR"
+ATTACK_SCALES = [0.25, 0.5]        # default downsample scales to evaluate
+
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 
 # ── Attack registry ───────────────────────────────────────────────────────────
-# name -> (module_name, attribute) for the removal function.  Modules are imported
-# lazily so only the selected attack's heavy model is loaded.
-#
-# Every removal function has the signature
-#     remove_watermark(image_path, out_dir="recon", **attack_kwargs) -> out_path
+# name -> module name that exposes remove_watermark(image_path, out_dir, **kwargs)
 ATTACKS = {
-    "compat":    ("compat_flux", "remove_watermark"),  # Flux2Klein diffusion removal
-    "nfpa":      ("nfpa",        "remove_watermark"),  # Next-Frame Prediction attack
-    "compat_sr": ("compat",      "remove_watermark"),  # Swin2SR + FluxVAE (no diffusion)
+    "compat":         "compat",
+    "compat_flux_v2": "compat_flux_v2",
+    # "diffusion":      "attacks.diffusion_attack.diffusion_attack",
 }
 
-# Convenient aliases.
 _ALIASES = {
-    "flux": "compat",
-    "compat_flux": "compat",
-    "nfp": "nfpa",
+    "sd3": "diffusion",
 }
 
 
 def list_attacks():
-    """Return the list of registered attack names."""
     return list(ATTACKS.keys())
 
 
@@ -103,56 +89,63 @@ def _resolve_attack_name(name):
     key = name.lower()
     key = _ALIASES.get(key, key)
     if key not in ATTACKS:
-        raise ValueError(
-            f"Unknown attack {name!r}. Available: {', '.join(ATTACKS)}"
-        )
+        raise ValueError(f"Unknown attack {name!r}. Available: {', '.join(ATTACKS)}")
     return key
 
 
-def load_remover(attack, skip_removal=False):
+def load_remover(attack, skip_removal=False, use_sam2=False, use_lbp=False):
     """
-    Return the ``remove_watermark`` callable for the named attack.
+    Return the remove_watermark callable for the named attack.
 
-    With ``skip_removal=True`` (or env SKIP_REMOVAL=1) returns a stub that raises
-    NotImplementedError, so the rest of the pipeline can be exercised without
-    loading any heavy model.
+    If the module exposes a class with a remove_watermark method (e.g. COMPAT),
+    instantiate it once and return the bound method so the model is loaded only once.
+    Otherwise fall back to the module-level remove_watermark function.
     """
     if skip_removal or os.environ.get("SKIP_REMOVAL") == "1":
         def _stub(image_path, out_dir="recon", **kwargs):
             raise NotImplementedError("SKIP_REMOVAL mode — removal disabled")
         return _stub
-
     key = _resolve_attack_name(attack)
-    mod_name, attr = ATTACKS[key]
-    mod = importlib.import_module(mod_name)
-    return getattr(mod, attr)
+    mod = importlib.import_module(ATTACKS[key])
+    for attr in dir(mod):
+        cls = getattr(mod, attr)
+        if isinstance(cls, type) and hasattr(cls, "remove_watermark"):
+            init_kwargs = {}
+            import inspect
+            sig = inspect.signature(cls.__init__)
+            if "use_sam2" in sig.parameters:
+                init_kwargs["use_sam2"] = use_sam2
+            if "use_lbp" in sig.parameters:
+                init_kwargs["use_lbp"] = use_lbp
+            return cls(**init_kwargs).remove_watermark
+    return mod.remove_watermark
 
-
-# ── Config defaults ───────────────────────────────────────────────────────────
-TEST_FOLDER = "test_folder"      # root containing <method>/<images> sub-dirs
-IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 
 # ── CSV schema ────────────────────────────────────────────────────────────────
 FIELDS = [
-    "removal_method",   # which removal pipeline was used
-    "image",            # filename (not full path)
-    "wm_method",        # watermark embedding method name
-    "scale",            # downsample scale used for the attack
-    "wm_detected",      # watermark present in watermarked image (sanity check)
-    "attacked_detected",# watermark present after removal attack
-    "psnr",             # dB, watermarked vs reconstruction
-    "ssim",             # [−1,1], watermarked vs reconstruction
-    "lpips",            # perceptual distance (lower = more similar)
-    "error",            # non-empty if any step raised an exception
+    "removal_method",
+    "image",
+    "wm_method",
+    "scale",
+    "wm_detected",
+    "wm_bit_accuracy",
+    "attacked_detected",
+    "attacked_bit_accuracy",
+    "psnr",
+    "ssim",
+    "lpips",
+    "error",
 ]
 
 SUMMARY_FIELDS = [
     "removal_method",
     "wm_method",
     "scale",
-    "total",             # images processed without fatal error
-    "wm_accuracy",       # fraction detected before attack  (higher = embedding works)
-    "attacked_accuracy", # fraction detected after attack   (lower  = attack works)
+    "total",
+    "wm_accuracy",
+    "avg_wm_bit_accuracy",
+    "attacked_accuracy",
+    "avg_attacked_bit_accuracy",
     "avg_psnr",
     "avg_ssim",
     "avg_lpips",
@@ -166,7 +159,6 @@ _metrics = MetricEvaluator()
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _iter_method_dirs(root):
-    """Yield (method_name, sorted list of image Paths) for each sub-dir of root."""
     root = Path(root)
     if not root.exists():
         raise FileNotFoundError(f"TEST_FOLDER not found: {root.resolve()}")
@@ -180,24 +172,16 @@ def _iter_method_dirs(root):
 
 
 def _to_tensor(pil_img):
-    """PIL RGB → (1, 3, H, W) float32 in [0, 1]."""
     return TF.to_tensor(pil_img.convert("RGB")).unsqueeze(0)
 
 
-
-def _get_detected(result: dict):
-    """
-    Extract the 'detected' boolean from a verify_watermark return dict.
-    Returns None for methods that do not report a detection decision
-    (e.g. watermark_anything, which only returns decoded bits).
-    """
+def _get_detected(result):
     if isinstance(result, dict) and "detected" in result:
         return bool(result["detected"])
     return None
 
 
 def _load_method(name):
-    """Import a watermark method by its package name.  Returns None on failure."""
     try:
         return importlib.import_module(name)
     except Exception as e:
@@ -205,208 +189,208 @@ def _load_method(name):
         return None
 
 
-def _load_removal_method(name):
-    """Import remove_watermark from a removal method module. Returns None on failure."""
-    if os.environ.get("SKIP_REMOVAL") == "1":
-        def _stub(image_path, out_dir="recon", scale=0.25):
-            raise NotImplementedError("SKIP_REMOVAL mode — removal disabled")
-        return _stub
-    try:
-        return importlib.import_module(name).remove_watermark
-    except Exception as e:
-        print(f"[removal:{name}] Cannot import: {e}")
-        return None
-
-
 # ── Accuracy accumulator ─────────────────────────────────────────────────────
 
 class _MethodStats:
     def __init__(self):
-        self.total = 0
-        self.wm_detected_count    = 0   # detected=True before attack
-        self.atk_detected_count   = 0   # detected=True after attack
-        self.wm_with_decision     = 0   # rows where detected is not None
-        self.atk_with_decision    = 0
-        self.psnr_sum  = 0.0
-        self.ssim_sum  = 0.0
-        self.lpips_sum = 0.0
+        self.total = self.wm_detected_count = self.atk_detected_count = 0
+        self.wm_with_decision = self.atk_with_decision = 0
+        self.psnr_sum = self.ssim_sum = self.lpips_sum = 0.0
+        self.wm_ba_sum = self.atk_ba_sum = 0.0
+        self.wm_ba_count = self.atk_ba_count = 0
         self.metric_count = 0
 
-    def update(self, wm_detected, attacked_detected, psnr_val, ssim_val, lpips_val):
+    def update(self, wm_detected, wm_ba, attacked_detected, atk_ba, psnr_val, ssim_val, lpips_val):
         self.total += 1
         if wm_detected is not None:
             self.wm_with_decision += 1
             self.wm_detected_count += int(wm_detected)
+        if wm_ba != "":
+            self.wm_ba_sum += float(wm_ba)
+            self.wm_ba_count += 1
         if attacked_detected is not None:
             self.atk_with_decision += 1
             self.atk_detected_count += int(attacked_detected)
+        if atk_ba != "":
+            self.atk_ba_sum += float(atk_ba)
+            self.atk_ba_count += 1
         if psnr_val != "":
             self.psnr_sum  += float(psnr_val)
             self.ssim_sum  += float(ssim_val)
             self.lpips_sum += float(lpips_val)
             self.metric_count += 1
 
-    def summary(self, removal_name, method_name, scale):
-        wm_acc  = (self.wm_detected_count  / self.wm_with_decision
-                   if self.wm_with_decision  else None)
-        atk_acc = (self.atk_detected_count / self.atk_with_decision
-                   if self.atk_with_decision else None)
-        avg_psnr  = self.psnr_sum  / self.metric_count if self.metric_count else None
-        avg_ssim  = self.ssim_sum  / self.metric_count if self.metric_count else None
-        avg_lpips = self.lpips_sum / self.metric_count if self.metric_count else None
+    def summary(self, removal_name, wm_method, scale):
+        def _avg(s, n): return round(s / n, 4) if n else ""
+        wm_acc  = _avg(self.wm_detected_count,  self.wm_with_decision)
+        atk_acc = _avg(self.atk_detected_count, self.atk_with_decision)
         return {
-            "removal_method":    removal_name,
-            "wm_method":         method_name,
-            "scale":             scale,
-            "total":             self.total,
-            "wm_accuracy":       round(wm_acc,  4) if wm_acc  is not None else "",
-            "attacked_accuracy": round(atk_acc, 4) if atk_acc is not None else "",
-            "avg_psnr":          round(avg_psnr,  4) if avg_psnr  is not None else "",
-            "avg_ssim":          round(avg_ssim,  4) if avg_ssim  is not None else "",
-            "avg_lpips":         round(avg_lpips, 4) if avg_lpips is not None else "",
+            "removal_method":           removal_name,
+            "wm_method":                wm_method,
+            "scale":                    scale,
+            "total":                    self.total,
+            "wm_accuracy":              wm_acc,
+            "avg_wm_bit_accuracy":      _avg(self.wm_ba_sum,  self.wm_ba_count),
+            "attacked_accuracy":        atk_acc,
+            "avg_attacked_bit_accuracy": _avg(self.atk_ba_sum, self.atk_ba_count),
+            "avg_psnr":                 _avg(self.psnr_sum,  self.metric_count),
+            "avg_ssim":                 _avg(self.ssim_sum,  self.metric_count),
+            "avg_lpips":                _avg(self.lpips_sum, self.metric_count),
         }
 
 
 # ── Main evaluation entry point ───────────────────────────────────────────────
 
-def run_evaluation(attack="compat", test_folder=TEST_FOLDER, out_dir=None,
+def run_evaluation(attack="compat", test_folder=None, out_dir=None,
                    csv_path=None, summary_csv=None, attack_kwargs=None,
-                   skip_removal=False):
+                   skip_removal=False, use_sam2=False, use_lbp=False):
     """
-    Run the watermark-removal evaluation for a single attack method.
+    Run the watermark-removal evaluation for a single attack.
 
     Args:
-        attack:        registered attack name (see ``list_attacks()``):
-                       'compat' (Flux2Klein), 'nfpa' (Next-Frame Prediction),
-                       'compat_sr' (Swin2SR + FluxVAE).
-        test_folder:   root containing <method>/<images> sub-directories.
-        out_dir:       where reconstructions are written
-                       (default ``eval_<attack>_out``).
-        csv_path:      per-image results CSV (default ``eval_<attack>_results.csv``).
-        summary_csv:   per-method summary CSV (default ``eval_<attack>_summary.csv``).
-        attack_kwargs: dict of extra kwargs forwarded to the removal function
-                       (e.g. {'scale': 0.25} for compat, {'num_inference_steps': 10,
-                       'xy': 40} for nfpa).
-        skip_removal:  if True, do not load/run the attack model (dry run).
+        attack:        registered attack name (see list_attacks()).
+        test_folder:   root with <wm_method>/<images> sub-dirs.
+        out_dir:       where reconstructions are written.
+        csv_path:      per-image results CSV.
+        summary_csv:   per-method summary CSV.
+        attack_kwargs: extra kwargs forwarded to remove_watermark()
+                       (e.g. {'scale': 0.25, 'strength': 0.75}).
+        skip_removal:  dry-run without loading any model.
 
     Returns:
         list of per-method summary dicts.
     """
-    attack = _resolve_attack_name(attack)
+    attack       = _resolve_attack_name(attack)
     attack_kwargs = dict(attack_kwargs or {})
 
-    out_dir     = out_dir     or f"eval_{attack}_out"
-    csv_path    = csv_path    or f"eval_{attack}_results.csv"
-    summary_csv = summary_csv or f"eval_{attack}_summary.csv"
+    test_folder = test_folder or TEST_FOLDER
+    out_dir     = out_dir     or f"out/eval_{attack}_out"
+    csv_path    = csv_path    or f"out/eval_{attack}_out/eval_{attack}_results.csv"
+    summary_csv = summary_csv or f"out/eval_{attack}_out/eval_{attack}_summary.csv"
+
+    # If caller passed a single scale, use it; otherwise iterate over defaults.
+    if "scale" in attack_kwargs:
+        scales = [attack_kwargs.pop("scale")]
+    else:
+        scales = ATTACK_SCALES
 
     os.makedirs(out_dir, exist_ok=True)
+    remove_wm = load_remover(attack, skip_removal=skip_removal,
+                             use_sam2=use_sam2, use_lbp=use_lbp)
 
-    remove_watermark = load_remover(attack, skip_removal=skip_removal)
-
-    # Per-image CSV — append mode so partial runs are preserved.
     csv_exists = os.path.exists(csv_path)
     csv_file   = open(csv_path, "a", newline="")
     writer     = csv.DictWriter(csv_file, fieldnames=FIELDS)
     if not csv_exists:
         writer.writeheader()
 
-    all_stats = {}   # (removal_name, wm_method, scale) -> _MethodStats
+    all_stats   = {}   # (wm_method, scale) -> _MethodStats
+    wm_objects  = {}   # wm_method -> Watermark instance (or None if init failed)
 
     try:
-        for wm_method, images in _iter_method_dirs(TEST_FOLDER):
+        for wm_method, images in _iter_method_dirs(test_folder):
             mod = _load_method(wm_method)
             if mod is None:
+                continue
+
+            if wm_method not in wm_objects:
+                try:
+                    wm_objects[wm_method] = mod.Watermark()
+                except Exception:
+                    print(f"[{wm_method}] Cannot init Watermark:\n"
+                          f"{traceback.format_exc(limit=2)}")
+                    wm_objects[wm_method] = None
+            wm = wm_objects[wm_method]
+            if wm is None:
                 continue
 
             for img_path in images:
                 filename = img_path.name
                 print(f"\n[{wm_method}] {filename}")
 
-                # Load original tensor once; reused across all removal methods and scales.
                 wm_t = _to_tensor(Image.open(img_path))
 
-                # ── 1. Verify watermark on the input image (once per image) ──
                 wm_detected = None
+                wm_bit_accuracy = ""
                 try:
-                    verify_wm   = mod.verify_watermark(str(img_path))
-                    wm_detected = _get_detected(verify_wm)
+                    verify_wm       = wm.verify_watermark(str(img_path))
+                    wm_detected     = _get_detected(verify_wm)
+                    wm_bit_accuracy = verify_wm.get("bit_accuracy", "") if isinstance(verify_wm, dict) else ""
                     print(f"  wm verify  : {verify_wm}")
                 except Exception:
                     print(f"  wm verify ERROR: {traceback.format_exc(limit=2)}")
 
-                # ── 2–4. For each removal method × scale: attack + verify + metrics ──
-                for removal_name in REMOVAL_METHODS:
-                    remove_wm = _load_removal_method(removal_name)
-                    if remove_wm is None:
+                for scale in scales:
+                    key = (wm_method, scale)
+                    if key not in all_stats:
+                        all_stats[key] = _MethodStats()
+                    stats = all_stats[key]
+
+                    recon_dir = os.path.join(out_dir, f"scale_{scale}", wm_method)
+                    os.makedirs(recon_dir, exist_ok=True)
+
+                    if os.path.exists(os.path.join(recon_dir, filename)):
+                        print(f"  [{attack}] scale={scale}  skip (output exists)")
                         continue
 
-                    for scale in ATTACK_SCALES:
-                        key = (removal_name, wm_method, scale)
-                        if key not in all_stats:
-                            all_stats[key] = _MethodStats()
-                        stats = all_stats[key]
+                    row = {f: "" for f in FIELDS}
+                    row["removal_method"]   = attack
+                    row["image"]            = filename
+                    row["wm_method"]        = wm_method
+                    row["scale"]            = scale
+                    row["wm_detected"]      = wm_detected
+                    row["wm_bit_accuracy"]  = wm_bit_accuracy
+                    attacked_detected       = None
+                    atk_bit_accuracy        = ""
 
-                        recon_dir = os.path.join(OUT_DIR, removal_name, wm_method, f"scale_{scale}")
-                        os.makedirs(recon_dir, exist_ok=True)
+                    try:
+                        recon_path = remove_wm(str(img_path),
+                                               out_dir=recon_dir,
+                                               scale=scale,
+                                               **attack_kwargs)
 
-                        if os.path.exists(os.path.join(recon_dir, filename)):
-                            print(f"  [{removal_name}] scale={scale}  skip (output exists)")
-                            continue
+                        def _load_recon(p):
+                            t = _to_tensor(Image.open(p).convert("RGB"))
+                            if wm_t.shape[-2:] != t.shape[-2:]:
+                                t = F.interpolate(t, size=wm_t.shape[-2:],
+                                                  mode="bilinear", align_corners=False,
+                                                  antialias=True)
+                            return t
 
-                        row = {f: "" for f in FIELDS}
-                        row["removal_method"] = removal_name
-                        row["image"]          = filename
-                        row["wm_method"]      = wm_method
-                        row["scale"]          = scale
-                        row["wm_detected"]    = wm_detected
-                        attacked_detected     = None
+                        with ThreadPoolExecutor(max_workers=2) as tex:
+                            fut_verify = tex.submit(wm.verify_watermark, recon_path)
+                            fut_recon  = tex.submit(_load_recon, recon_path)
+                            verify_atk = fut_verify.result()
+                            recon_t    = fut_recon.result()
 
-                        try:
-                            recon_path = remove_wm(str(img_path),
-                                                    out_dir=recon_dir,
-                                                    scale=scale)
+                        attacked_detected             = _get_detected(verify_atk)
+                        atk_bit_accuracy              = verify_atk.get("bit_accuracy", "") if isinstance(verify_atk, dict) else ""
+                        row["attacked_detected"]      = attacked_detected
+                        row["attacked_bit_accuracy"]  = atk_bit_accuracy
+                        print(f"  [{attack}] scale={scale}  atk verify : {verify_atk}")
 
-                            # Overlap verify (CPU) with loading the recon tensor (disk I/O).
-                            def _load_recon(p):
-                                t = _to_tensor(Image.open(p).convert("RGB"))
-                                if wm_t.shape[-2:] != t.shape[-2:]:
-                                    t = F.interpolate(t, size=wm_t.shape[-2:],
-                                                      mode="bilinear", align_corners=False,
-                                                      antialias=True)
-                                return t
+                        row["psnr"]  = round(_metrics.psnr(wm_t, recon_t), 4)
+                        row["ssim"]  = round(_metrics.ssim(wm_t, recon_t), 4)
+                        row["lpips"] = round(_metrics.lpips(wm_t, recon_t), 4)
+                        print(f"  [{attack}] scale={scale}  "
+                              f"PSNR={row['psnr']} dB  SSIM={row['ssim']}  LPIPS={row['lpips']}")
 
-                            with ThreadPoolExecutor(max_workers=2) as tex:
-                                fut_verify = tex.submit(mod.verify_watermark, recon_path)
-                                fut_recon  = tex.submit(_load_recon, recon_path)
-                                verify_atk = fut_verify.result()
-                                recon_t    = fut_recon.result()
+                    except Exception:
+                        err = traceback.format_exc(limit=3)
+                        row["error"] = err.replace("\n", " | ")
+                        print(f"  [{attack}] scale={scale}  ERROR: {err}")
 
-                            attacked_detected = _get_detected(verify_atk)
-                            row["attacked_detected"] = attacked_detected
-                            print(f"  [{removal_name}] scale={scale}  atk verify : {verify_atk}")
-
-                            row["psnr"]   = round(_metrics.psnr(wm_t, recon_t), 4)
-                            row["ssim"]   = round(_metrics.ssim(wm_t, recon_t), 4)
-                            row["lpips"]  = round(_metrics.lpips(wm_t, recon_t), 4)
-                            print(f"  [{removal_name}] scale={scale}  PSNR={row['psnr']} dB  "
-                                  f"SSIM={row['ssim']}  LPIPS={row['lpips']}")
-
-                        except Exception:
-                            err = traceback.format_exc(limit=3)
-                            row["error"] = err.replace("\n", " | ")
-                            print(f"  [{removal_name}] scale={scale}  ERROR: {err}")
-
-                        stats.update(wm_detected, attacked_detected,
-                                     row["psnr"], row["ssim"], row["lpips"])
-                        writer.writerow(row)
-                        csv_file.flush()
+                    stats.update(wm_detected, wm_bit_accuracy,
+                                 attacked_detected, atk_bit_accuracy,
+                                 row["psnr"], row["ssim"], row["lpips"])
+                    writer.writerow(row)
+                    csv_file.flush()
 
     finally:
         csv_file.close()
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    summary_rows = [s.summary(rm, wm, sc)
-                    for (rm, wm, sc), s in sorted(all_stats.items())]
+    summary_rows = [s.summary(attack, wm, sc)
+                    for (wm, sc), s in sorted(all_stats.items())]
 
     with open(summary_csv, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=SUMMARY_FIELDS)
@@ -414,11 +398,13 @@ def run_evaluation(attack="compat", test_folder=TEST_FOLDER, out_dir=None,
         w.writerows(summary_rows)
 
     print(f"\n{'removal':<20} {'wm_method':<18} {'scale':>6} {'total':>6} "
-          f"{'wm_acc':>8} {'atk_acc':>8} {'avg_psnr':>10} {'avg_ssim':>9} {'avg_lpips':>10}")
-    print("-" * 100)
+          f"{'wm_acc':>8} {'wm_ba':>8} {'atk_acc':>8} {'atk_ba':>8} "
+          f"{'avg_psnr':>10} {'avg_ssim':>9} {'avg_lpips':>10}")
+    print("-" * 115)
     for r in summary_rows:
-        print(f"{r['removal_method']:<20} {r['wm_method']:<18} {str(r['scale']):>6} {r['total']:>6} "
-              f"{str(r['wm_accuracy']):>8} {str(r['attacked_accuracy']):>8} "
+        print(f"{r['removal_method']:<20} {r['wm_method']:<18} {str(r['scale']):>6} "
+              f"{r['total']:>6} {str(r['wm_accuracy']):>8} {str(r['avg_wm_bit_accuracy']):>8} "
+              f"{str(r['attacked_accuracy']):>8} {str(r['avg_attacked_bit_accuracy']):>8} "
               f"{str(r['avg_psnr']):>10} {str(r['avg_ssim']):>9} {str(r['avg_lpips']):>10}")
 
     print(f"\nPer-image results : {csv_path}")
@@ -426,59 +412,51 @@ def run_evaluation(attack="compat", test_folder=TEST_FOLDER, out_dir=None,
     return summary_rows
 
 
-# ── CLI ────────────────────────────────────────────────────────────────────────
-
-def _parse_attack_kwargs(args):
-    """Build the attack_kwargs dict from the relevant CLI options."""
-    kwargs = {}
-    if args.scale is not None:
-        kwargs["scale"] = args.scale
-    if args.steps is not None:
-        kwargs["num_inference_steps"] = args.steps
-    if args.xy is not None:
-        kwargs["xy"] = args.xy
-    for item in (args.attack_arg or []):
-        if "=" not in item:
-            raise ValueError(f"--attack-arg must be key=value, got {item!r}")
-        k, v = item.split("=", 1)
-        # best-effort type coercion
-        try:
-            v = int(v)
-        except ValueError:
-            try:
-                v = float(v)
-            except ValueError:
-                pass
-        kwargs[k] = v
-    return kwargs
-
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Unified watermark-removal evaluation (COMPAT / NFPA / ...).")
+        description="Unified watermark-removal evaluation.")
     parser.add_argument("--attack", default="compat",
                         help=f"removal attack: {', '.join(list_attacks())} (default: compat)")
-    parser.add_argument("--test-folder", default=TEST_FOLDER,
-                        help="root with <method>/<images> sub-dirs (default: test_folder)")
+    parser.add_argument("--test-folder", default=None,
+                        help=f"root with <method>/<images> sub-dirs (default: {TEST_FOLDER})")
     parser.add_argument("--out-dir", default=None,
                         help="output dir for reconstructions (default: eval_<attack>_out)")
     parser.add_argument("--csv", default=None,
                         help="per-image results CSV (default: eval_<attack>_results.csv)")
     parser.add_argument("--summary", default=None,
-                        help="per-method summary CSV (default: eval_<attack>_summary.csv)")
+                        help="summary CSV (default: eval_<attack>_summary.csv)")
     parser.add_argument("--skip-removal", action="store_true",
                         help="dry run: do not load/run any attack model")
-    # Attack hyper-parameters (only the relevant ones are forwarded).
+    parser.add_argument("--use-sam2", action="store_true",
+                        help="enable SAM2 segmentation features in COMPAT")
+    parser.add_argument("--use-lbp",  action="store_true",
+                        help="enable LBP texture features in COMPAT")
     parser.add_argument("--scale", type=float, default=None,
-                        help="[compat/compat_sr] downsample factor (default 0.25)")
+                        help="single downsample scale (default: use ATTACK_SCALES list)")
     parser.add_argument("--steps", type=int, default=None,
-                        help="[nfpa] DDIM inversion/denoising steps (default 10)")
-    parser.add_argument("--xy", type=int, default=None,
-                        help="[nfpa] motion-field warp range (default 40)")
+                        help="num_inference_steps forwarded to the attack")
+    parser.add_argument("--strength", type=float, default=None,
+                        help="img2img strength forwarded to the attack (0–1)")
     parser.add_argument("--attack-arg", action="append", default=None,
                         metavar="KEY=VALUE",
-                        help="extra kwarg forwarded to the removal function (repeatable)")
+                        help="extra kwarg forwarded to remove_watermark() (repeatable)")
     args = parser.parse_args()
+
+    attack_kwargs = {}
+    if args.scale    is not None: attack_kwargs["scale"]                = args.scale
+    if args.steps    is not None: attack_kwargs["num_inference_steps"]  = args.steps
+    if args.strength is not None: attack_kwargs["strength"]             = args.strength
+    for item in (args.attack_arg or []):
+        if "=" not in item:
+            raise ValueError(f"--attack-arg must be key=value, got {item!r}")
+        k, v = item.split("=", 1)
+        try:    v = int(v)
+        except ValueError:
+            try: v = float(v)
+            except ValueError: pass
+        attack_kwargs[k] = v
 
     run_evaluation(
         attack=args.attack,
@@ -486,8 +464,10 @@ def main():
         out_dir=args.out_dir,
         csv_path=args.csv,
         summary_csv=args.summary,
-        attack_kwargs=_parse_attack_kwargs(args),
+        attack_kwargs=attack_kwargs,
         skip_removal=args.skip_removal,
+        use_sam2=args.use_sam2,
+        use_lbp=args.use_lbp,
     )
 
 

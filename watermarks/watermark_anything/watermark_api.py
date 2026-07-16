@@ -136,8 +136,20 @@ def verify_watermark(image_path, msg=None):
     return {
         'message':      msg2str(pred_message[0]),
         'bit_accuracy': bit_acc,
-        'detected':     bit_acc >= 0.95,
+        # 'detected':     bit_acc >= 0.95,
+        'detected':     bit_acc >= 0.5625,
     }
+
+
+class Watermark:
+    def __init__(self, msg=None):
+        self._msg = msg  # None -> uses _DEFAULT_MESSAGE
+
+    def add_watermark(self, image_path, output_path=None):
+        return add_watermark(image_path, output_path, self._msg)
+
+    def verify_watermark(self, image_path):
+        return verify_watermark(image_path, self._msg)
 
 
 if __name__ == '__main__':

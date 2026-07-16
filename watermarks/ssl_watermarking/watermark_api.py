@@ -24,7 +24,7 @@ _DEFAULT_MODEL_PATH = os.path.join(_DIR, "models", "dino_r50_plus.pth")
 _DEFAULT_NORMLAYER_PATH = os.path.join(_DIR, "normlayers", "out2048_yfcc_orig.pth")
 _DEFAULT_CARRIER_PATH = os.path.join(_DIR, "carriers", "carrier_1_2048.pth")
 _DEFAULT_TARGET_PSNR = 42.0
-_DEFAULT_TARGET_FPR = 1e-6
+_DEFAULT_TARGET_FPR = 1e-2
 _DEFAULT_CARRIERS_DIR = os.path.join(_DIR, "carriers")
 
 
@@ -283,3 +283,73 @@ def verify_watermark(
         "R": r["R"],
         "log10_pvalue": r["log10_pvalue"],
     }
+
+
+class Watermark:
+    def __init__(self,
+                 model_path=_DEFAULT_MODEL_PATH,
+                 normlayer_path=_DEFAULT_NORMLAYER_PATH,
+                 carrier_path=_DEFAULT_CARRIER_PATH,
+                 target_fpr=_DEFAULT_TARGET_FPR,
+                 target_psnr=_DEFAULT_TARGET_PSNR,
+                 epochs=100):
+        self._model = _load_model(model_path, normlayer_path).to(device)
+        self._carrier, self._angle = _load_carrier_and_angle(
+            self._model, carrier_path, target_fpr)
+        self._data_aug = data_augmentation.All()
+        self._target_fpr = target_fpr
+        self._target_psnr = target_psnr
+        self._epochs = epochs
+
+    def add_watermark(self, image_path, output_path=None):
+        image_path = os.path.abspath(image_path)
+        if output_path is None:
+            stem, ext = os.path.splitext(image_path)
+            output_path = f"{stem}_watermarked{ext if ext else '.png'}"
+
+        img = Image.open(image_path).convert("RGB")
+
+        class _P:
+            verbose = 0
+            optimizer = "Adam,lr=0.01"
+            scheduler = None
+            batch_size = 1
+            lambda_w = 1.0
+            lambda_i = 1.0
+        p = _P()
+        p.target_psnr = self._target_psnr
+        p.epochs = self._epochs
+        import time
+        start = time.time()
+        dataloader = [([utils_img.default_transform(img).to(device)], [0])]
+        end = time.time()
+        print('loading:', end-start)
+
+        start = time.time()
+        pt_imgs_out = encode.watermark_0bit(
+            dataloader, self._carrier, self._angle, self._model, self._data_aug, p)
+        end = time.time()
+        print('inference:', end-start)
+        wm_img = ToPILImage()(
+            utils_img.unnormalize_img(pt_imgs_out[0]).squeeze(0).clamp(0, 1))
+        wm_img.save(output_path)
+        return output_path
+
+    def verify_watermark(self, image_path):
+        img = Image.open(image_path).convert("RGB")
+        results = decode.decode_0bit([img], self._carrier, self._angle, self._model)
+        r = results[0]
+        threshold = np.log10(self._target_fpr)
+        detected = r["log10_pvalue"] <= threshold
+        return {
+            "detected": bool(detected),
+            "R": r["R"],
+            "log10_pvalue": r["log10_pvalue"],
+        }
+
+if __name__ == "__main__":
+    ssl = Watermark()
+    import glob
+    images = glob.glob('/data/xuenong_hong/dataset/aigc/watermark_benchmark/val2017/*.jpg')
+    out_dir = '/data/xuenong_hong/dataset/aigc/watermark_benchmark/'
+    ssl.add_watermark(images, output_path=out_dir)

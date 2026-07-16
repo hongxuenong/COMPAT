@@ -60,3 +60,15 @@ def verify_watermark(image_path, watermark=_DEFAULT_WATERMARK, method=_DEFAULT_M
         'detected': decoded == watermark,
         'message': decoded,
     }
+
+
+class Watermark:
+    def __init__(self, watermark=_DEFAULT_WATERMARK, method=_DEFAULT_METHOD):
+        self._watermark = watermark
+        self._method = method
+
+    def add_watermark(self, image_path, output_path=None):
+        return add_watermark(image_path, output_path, self._watermark, self._method)
+
+    def verify_watermark(self, image_path):
+        return verify_watermark(image_path, self._watermark, self._method)
