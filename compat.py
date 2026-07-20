@@ -13,6 +13,8 @@ Usage:
 import io
 import os
 
+import cv2
+import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
@@ -37,7 +39,8 @@ class COMPAT:
 
     def __init__(self, flux_model_path: str = _FLUX_MODEL_PATH,
                  sam2_checkpoint: str = _SAM2_CHECKPOINT, sam2_config: str = _SAM2_CONFIG,
-                 use_sam2: bool = True, use_lbp: bool = True):
+                 use_sam2: bool = True, use_lbp: bool = True,
+                 use_find_edges: bool = True):
         from diffusers import Flux2KleinPipeline
         self._flux = Flux2KleinPipeline.from_pretrained(
             flux_model_path, torch_dtype=dtype
@@ -45,6 +48,7 @@ class COMPAT:
         print(f"Loaded Flux2KleinPipeline from {flux_model_path}")
 
         self._use_lbp = use_lbp
+        self._use_find_edges = use_find_edges
         self._mask_generator = None
         if use_sam2:
             from sam2.build_sam import build_sam2
@@ -53,10 +57,12 @@ class COMPAT:
             self._mask_generator = SAM2AutomaticMaskGenerator(sam2_model)
             print(f"Loaded SAM2 from {sam2_checkpoint}")
 
-    def degrade_scale(self, image: Image.Image, scale: float = 0.25) -> Image.Image:
-        W, H = image.size
-        lw, lh = max(1, int(W * scale)), max(1, int(H * scale))
-        return image.resize((lw, lh), Image.BICUBIC).resize((W, H), Image.BICUBIC)
+    def degrade_scale(self, image: Image.Image, scale: int = 128) -> Image.Image:
+        image = TF.to_tensor(image).unsqueeze(0)
+        lr = F.interpolate(image, size=(scale, scale), mode="bilinear",
+                       align_corners=False, antialias=True)
+        lr_pil = TF.to_pil_image(lr[0].clamp(0, 1))
+        return lr_pil
 
     def degrade_blur(self, image: Image.Image, sigma: float = 3.0) -> Image.Image:
         return image.filter(ImageFilter.GaussianBlur(radius=sigma))
@@ -108,7 +114,10 @@ class COMPAT:
         return Image.fromarray(seg_map)
 
     def feature_extraction(self, image: Image.Image) -> list:
-        features = [image.filter(ImageFilter.FIND_EDGES)]
+        if self._use_find_edges:
+            features = [image.filter(ImageFilter.FIND_EDGES)]
+        else:
+            features = []
         if self._use_lbp:
             features.append(self.feature_extraction_lbp(image))
         if self._mask_generator is not None:
@@ -139,15 +148,31 @@ class COMPAT:
             result = result.crop((0, 0, W, H))
         return result
 
+    def calibration(source, target):
+        from calib import histogram_match
+        source = np.array(source, dtype=np.float32) / 255.0
+        target = np.array(target, dtype=np.float32) / 255.0
+        corrected = histogram_match(source, target)
+        return Image.fromarray((corrected * 255).round().astype(np.uint8))
     def remove_watermark(self, image_path: str, out_dir: str = "recon",
                          degrade_method: str = "scale", **degrade_kwargs) -> str:
         pil = Image.open(image_path).convert("RGB")
         W, H = pil.size
 
+        # Pad to the nearest multiple of 16 with black (zero) pixels
+        img = TF.to_tensor(pil).unsqueeze(0)   # (1, 3, H, W) in [0, 1]
+        _, _, H, W = img.shape
+        H_pad = (16 - H % 16) % 16
+        W_pad = (16 - W % 16) % 16
+        if H_pad or W_pad:
+            img = F.pad(img, (0, W_pad, 0, H_pad), value=0.)
+        pil = TF.to_pil_image(img[0].clamp(0, 1))
+
         degraded     = self.degrade(pil, method=degrade_method, **degrade_kwargs)
         feature_list = self.feature_extraction(pil)
         result       = self.reconstruct(degraded, target_size=(W, H), feature_list=feature_list)
 
+        result = self.calibration(result, pil)
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, os.path.basename(image_path))
         result.save(out_path)

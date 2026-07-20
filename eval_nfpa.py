@@ -56,6 +56,9 @@ from pathlib import Path
 import torch
 import torchvision.transforms.functional as TF
 from PIL import Image
+from tqdm import tqdm
+from metric import MetricEvaluator
+_metrics = MetricEvaluator()
 
 # ── Project paths ─────────────────────────────────────────────────────────────
 _ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -138,8 +141,10 @@ FIELDS = [
     "wm_detected",      # watermark present in watermarked image (sanity check)
     "wm_key_accurate",
     "attacked_detected",# watermark present after removal attack
+    "attacked_bit_accuracy",
     "psnr",             # dB, watermarked vs reconstruction
     "ssim",             # [−1,1], watermarked vs reconstruction
+    "clip_score",
     "error",            # non-empty if any step raised an exception
 ]
 
@@ -150,8 +155,10 @@ SUMMARY_FIELDS = [
     "wm_accuracy",       # fraction detected before attack  (higher = embedding works)
     "wm_key_accurate",
     "attacked_accuracy", # fraction detected after attack   (lower  = attack works)
+    "avg_attacked_bit_accuracy",
     "avg_psnr",
     "avg_ssim",
+    "avg_clip_score",
 ]
 
 
@@ -218,15 +225,16 @@ def _load_method(name):
 class _MethodStats:
     def __init__(self):
         self.total = 0
-        self.wm_detected_count    = 0   # detected=True before attack
-        self.atk_detected_count   = 0   # detected=True after attack
-        self.wm_with_decision     = 0   # rows where detected is not None
+        self.wm_detected_count    = 0
+        self.atk_detected_count   = 0
+        self.wm_with_decision     = 0
         self.atk_with_decision    = 0
-        self.psnr_sum = 0.0
-        self.ssim_sum = 0.0
+        self.atk_ba_sum = 0.0
+        self.atk_ba_count = 0
+        self.psnr_sum = self.ssim_sum = self.clip_sum = 0.0
         self.metric_count = 0
 
-    def update(self, wm_detected, attacked_detected, psnr_val, ssim_val):
+    def update(self, wm_detected, attacked_detected, atk_ba, psnr_val, ssim_val, clip_val):
         self.total += 1
         if wm_detected is not None:
             self.wm_with_decision += 1
@@ -234,26 +242,32 @@ class _MethodStats:
         if attacked_detected is not None:
             self.atk_with_decision += 1
             self.atk_detected_count += int(attacked_detected)
+        if atk_ba != "":
+            self.atk_ba_sum += float(atk_ba)
+            self.atk_ba_count += 1
         if psnr_val != "":
-            self.psnr_sum  += float(psnr_val)
-            self.ssim_sum  += float(ssim_val)
+            self.psnr_sum += float(psnr_val)
+            self.ssim_sum += float(ssim_val)
             self.metric_count += 1
+        if clip_val != "":
+            self.clip_sum += float(clip_val)
 
     def summary(self, method_name, attack_name):
+        def _avg(s, n): return round(s / n, 4) if n else ""
         wm_acc  = (self.wm_detected_count  / self.wm_with_decision
                    if self.wm_with_decision  else None)
         atk_acc = (self.atk_detected_count / self.atk_with_decision
                    if self.atk_with_decision else None)
-        avg_psnr = self.psnr_sum / self.metric_count if self.metric_count else None
-        avg_ssim = self.ssim_sum / self.metric_count if self.metric_count else None
         return {
-            "method":            method_name,
-            "attack":            attack_name,
-            "total":             self.total,
-            "wm_accuracy":       round(wm_acc,  4) if wm_acc  is not None else "",
-            "attacked_accuracy": round(atk_acc, 4) if atk_acc is not None else "",
-            "avg_psnr":          round(avg_psnr, 4) if avg_psnr is not None else "",
-            "avg_ssim":          round(avg_ssim, 4) if avg_ssim is not None else "",
+            "method":                    method_name,
+            "attack":                    attack_name,
+            "total":                     self.total,
+            "wm_accuracy":               round(wm_acc,  4) if wm_acc  is not None else "",
+            "attacked_accuracy":         round(atk_acc, 4) if atk_acc is not None else "",
+            "avg_attacked_bit_accuracy": _avg(self.atk_ba_sum, self.atk_ba_count),
+            "avg_psnr":                  _avg(self.psnr_sum,  self.metric_count),
+            "avg_ssim":                  _avg(self.ssim_sum,  self.metric_count),
+            "avg_clip_score":            _avg(self.clip_sum,  self.metric_count),
         }
 
 
@@ -295,29 +309,45 @@ def run_evaluation(attack="compat", test_folder=TEST_FOLDER, out_dir=None,
 
     # Per-image CSV — append mode so partial runs are preserved.
     csv_exists = os.path.exists(csv_path)
-    csv_file   = open(csv_path, "a", newline="")
-    writer     = csv.DictWriter(csv_file, fieldnames=FIELDS)
+
+    # Build set of (method, image) rows already in the CSV so we can skip them
+    done = set()
+    if csv_exists:
+        with open(csv_path, newline="") as _f:
+            for r in csv.DictReader(_f):
+                done.add((r.get("method", ""), r.get("image", "")))
+
+    csv_file = open(csv_path, "a", newline="")
+    writer   = csv.DictWriter(csv_file, fieldnames=FIELDS)
     if not csv_exists:
         writer.writeheader()
 
-    all_stats  = {}   # method_name -> _MethodStats
-    wm_objects = {}   # method_name -> Watermark instance (or None if init failed)
+    all_stats  = {}
+    wm_objects = {}
 
+    # Collect all (method, images) upfront so tqdm knows the total
+    method_dirs = [(m, imgs) for m, imgs in _iter_method_dirs(test_folder)]
+    total_images = sum(len(imgs) for _, imgs in method_dirs)
+
+    pbar = tqdm(total=total_images, unit="img", dynamic_ncols=True)
     try:
-        for method_name, images in _iter_method_dirs(test_folder):
+        for method_name, images in method_dirs:
             mod = _load_method(method_name)
             if mod is None:
+                pbar.update(len(images))
                 continue
 
             if method_name not in wm_objects:
                 try:
+                    pbar.set_description(f"Loading {method_name}")
                     wm_objects[method_name] = mod.Watermark()
                 except Exception:
-                    print(f"[{method_name}] Cannot init Watermark:\n"
-                          f"{traceback.format_exc(limit=2)}")
+                    tqdm.write(f"[{method_name}] Cannot init Watermark: "
+                               f"{traceback.format_exc(limit=1).strip()}")
                     wm_objects[method_name] = None
             wm = wm_objects[method_name]
             if wm is None:
+                pbar.update(len(images))
                 continue
 
             recon_dir = os.path.join(out_dir, method_name)
@@ -328,55 +358,60 @@ def run_evaluation(attack="compat", test_folder=TEST_FOLDER, out_dir=None,
 
             for img_path in images:
                 filename = img_path.name
+                pbar.set_description(f"{method_name}/{filename}")
+
+                if (method_name, filename) in done:
+                    pbar.update(1)
+                    continue
+
                 row = {f: "" for f in FIELDS}
                 row["image"]  = filename
                 row["method"] = method_name
                 row["attack"] = attack
 
                 wm_detected = attacked_detected = None
-
-                print(f"\n[{attack}] [{method_name}] {filename}")
-
+                atk_bit_accuracy = ""
                 recon_path = os.path.join(recon_dir, filename)
-                if os.path.exists(recon_path):
-                    print(f"  [{attack}] skip (output exists)")
-                    continue
 
                 try:
-                    # ── 1. Verify watermark on the input image ────────────────
-                    verify_wm   = wm.verify_watermark(str(img_path))
-                    wm_detected = _get_detected(verify_wm)
+                    verify_wm          = wm.verify_watermark(str(img_path))
+                    wm_detected        = _get_detected(verify_wm)
                     row["wm_detected"] = wm_detected
-                    print(f"  wm verify  : {verify_wm}")
 
-                    # ── 2. Attack: remove watermark ───────────────────────────
-                    recon_path = remove_watermark(str(img_path), out_dir=recon_dir,
-                                                  **attack_kwargs)
+                    if not os.path.exists(recon_path):
+                        recon_path = remove_watermark(str(img_path), out_dir=recon_dir,
+                                                      **attack_kwargs)
 
-                    # ── 3. Verify watermark on reconstruction ─────────────────
-                    verify_atk        = wm.verify_watermark(recon_path)
-                    attacked_detected = _get_detected(verify_atk)
-                    row["attacked_detected"] = attacked_detected
-                    print(f"  atk verify : {verify_atk}")
+                    verify_atk                    = wm.verify_watermark(recon_path)
+                    attacked_detected             = _get_detected(verify_atk)
+                    atk_bit_accuracy              = verify_atk.get("bit_accuracy", "") if isinstance(verify_atk, dict) else ""
+                    row["attacked_detected"]      = attacked_detected
+                    row["attacked_bit_accuracy"]  = atk_bit_accuracy
 
-                    # ── 4. PSNR / SSIM (watermarked vs reconstruction) ────────
-                    from metric import psnr as _psnr, ssim as _ssim
-                    wm_t, recon_t  = _load_metric_pair(str(img_path), recon_path)
-                    row["psnr"]    = round(_psnr(wm_t, recon_t), 4)
-                    row["ssim"]    = round(_ssim(wm_t, recon_t), 4)
-                    print(f"  PSNR={row['psnr']} dB  SSIM={row['ssim']}")
+                    wm_t, recon_t     = _load_metric_pair(str(img_path), recon_path)
+                    row["psnr"]       = round(_metrics.psnr(wm_t, recon_t), 4)
+                    row["ssim"]       = round(_metrics.ssim(wm_t, recon_t), 4)
+                    row["clip_score"] = round(_metrics.clip_score(wm_t, recon_t), 4)
+
+                    pbar.set_postfix(
+                        det=str(attacked_detected),
+                        psnr=row["psnr"],
+                        ssim=row["ssim"],
+                    )
 
                 except Exception:
                     err = traceback.format_exc(limit=3)
                     row["error"] = err.replace("\n", " | ")
-                    print(f"  ERROR: {err}")
+                    tqdm.write(f"ERROR [{method_name}] {filename}: {err.splitlines()[-1]}")
 
-                stats.update(wm_detected, attacked_detected,
-                             row["psnr"], row["ssim"])
+                stats.update(wm_detected, attacked_detected, atk_bit_accuracy,
+                             row["psnr"], row["ssim"], row["clip_score"])
                 writer.writerow(row)
                 csv_file.flush()
+                pbar.update(1)
 
     finally:
+        pbar.close()
         csv_file.close()
 
     # ── Per-method accuracy summary ───────────────────────────────────────────
@@ -387,12 +422,14 @@ def run_evaluation(attack="compat", test_folder=TEST_FOLDER, out_dir=None,
         w.writeheader()
         w.writerows(summary_rows)
 
-    print(f"\nAttack: {attack}")
-    print(f"{'method':<22} {'total':>6} {'wm_acc':>8} {'atk_acc':>8} {'avg_psnr':>10} {'avg_ssim':>9}")
-    print("-" * 70)
+    print(f"\nAttack : {attack}")
+    print(f"{'method':<22} {'total':>6} {'wm_acc':>8} {'atk_acc':>8} "
+          f"{'atk_ba':>8} {'avg_psnr':>10} {'avg_ssim':>9} {'avg_clip':>9}")
+    print("-" * 86)
     for r in summary_rows:
         print(f"{r['method']:<22} {r['total']:>6} {str(r['wm_accuracy']):>8} "
-              f"{str(r['attacked_accuracy']):>8} {str(r['avg_psnr']):>10} {str(r['avg_ssim']):>9}")
+              f"{str(r['attacked_accuracy']):>8} {str(r['avg_attacked_bit_accuracy']):>8} "
+              f"{str(r['avg_psnr']):>10} {str(r['avg_ssim']):>9} {str(r['avg_clip_score']):>9}")
 
     print(f"\nPer-image results : {csv_path}")
     print(f"Summary           : {summary_csv}")

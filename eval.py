@@ -52,6 +52,7 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from PIL import Image
+from tqdm import tqdm
 
 # ── Project paths ─────────────────────────────────────────────────────────────
 _ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -63,7 +64,7 @@ if _WM_DIR not in sys.path:
 # ── Config ────────────────────────────────────────────────────────────────────
 # TEST_FOLDER   = "/data/xuenong_hong/dataset/aigc/watermark_benchmark/watermarked"      # root containing <wm_method>/<images> sub-dirs
 # TEST_FOLDER   = "/data/xuenong_hong/dataset/aigc/watermark_benchmark/watermarked"      # root containing <wm_method>/<images> sub-dirs
-TEST_FOLDER   = "/data/xuenong_hong/dataset/aigc/watermark_benchmark/watermark_1FAR"
+TEST_FOLDER   = "/data/xuenong_hong/dataset/aigc/watermark_benchmark/watermarked"
 ATTACK_SCALES = [0.25, 0.5]        # default downsample scales to evaluate
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
@@ -134,6 +135,7 @@ FIELDS = [
     "psnr",
     "ssim",
     "lpips",
+    "clip_score",
     "error",
 ]
 
@@ -149,6 +151,7 @@ SUMMARY_FIELDS = [
     "avg_psnr",
     "avg_ssim",
     "avg_lpips",
+    "avg_clip_score",
 ]
 
 # ── Metrics ───────────────────────────────────────────────────────────────────
@@ -195,12 +198,12 @@ class _MethodStats:
     def __init__(self):
         self.total = self.wm_detected_count = self.atk_detected_count = 0
         self.wm_with_decision = self.atk_with_decision = 0
-        self.psnr_sum = self.ssim_sum = self.lpips_sum = 0.0
+        self.psnr_sum = self.ssim_sum = self.lpips_sum = self.clip_sum = 0.0
         self.wm_ba_sum = self.atk_ba_sum = 0.0
         self.wm_ba_count = self.atk_ba_count = 0
         self.metric_count = 0
 
-    def update(self, wm_detected, wm_ba, attacked_detected, atk_ba, psnr_val, ssim_val, lpips_val):
+    def update(self, wm_detected, wm_ba, attacked_detected, atk_ba, psnr_val, ssim_val, lpips_val, clip_val):
         self.total += 1
         if wm_detected is not None:
             self.wm_with_decision += 1
@@ -219,23 +222,26 @@ class _MethodStats:
             self.ssim_sum  += float(ssim_val)
             self.lpips_sum += float(lpips_val)
             self.metric_count += 1
+        if clip_val != "":
+            self.clip_sum += float(clip_val)
 
     def summary(self, removal_name, wm_method, scale):
         def _avg(s, n): return round(s / n, 4) if n else ""
         wm_acc  = _avg(self.wm_detected_count,  self.wm_with_decision)
         atk_acc = _avg(self.atk_detected_count, self.atk_with_decision)
         return {
-            "removal_method":           removal_name,
-            "wm_method":                wm_method,
-            "scale":                    scale,
-            "total":                    self.total,
-            "wm_accuracy":              wm_acc,
-            "avg_wm_bit_accuracy":      _avg(self.wm_ba_sum,  self.wm_ba_count),
-            "attacked_accuracy":        atk_acc,
+            "removal_method":            removal_name,
+            "wm_method":                 wm_method,
+            "scale":                     scale,
+            "total":                     self.total,
+            "wm_accuracy":               wm_acc,
+            "avg_wm_bit_accuracy":       _avg(self.wm_ba_sum,  self.wm_ba_count),
+            "attacked_accuracy":         atk_acc,
             "avg_attacked_bit_accuracy": _avg(self.atk_ba_sum, self.atk_ba_count),
-            "avg_psnr":                 _avg(self.psnr_sum,  self.metric_count),
-            "avg_ssim":                 _avg(self.ssim_sum,  self.metric_count),
-            "avg_lpips":                _avg(self.lpips_sum, self.metric_count),
+            "avg_psnr":                  _avg(self.psnr_sum,  self.metric_count),
+            "avg_ssim":                  _avg(self.ssim_sum,  self.metric_count),
+            "avg_lpips":                 _avg(self.lpips_sum, self.metric_count),
+            "avg_clip_score":            _avg(self.clip_sum,  self.metric_count),
         }
 
 
@@ -243,7 +249,8 @@ class _MethodStats:
 
 def run_evaluation(attack="compat", test_folder=None, out_dir=None,
                    csv_path=None, summary_csv=None, attack_kwargs=None,
-                   skip_removal=False, use_sam2=False, use_lbp=False):
+                   skip_removal=False, use_sam2=False, use_lbp=False,
+                   n_samples=None):
     """
     Run the watermark-removal evaluation for a single attack.
 
@@ -279,34 +286,60 @@ def run_evaluation(attack="compat", test_folder=None, out_dir=None,
                              use_sam2=use_sam2, use_lbp=use_lbp)
 
     csv_exists = os.path.exists(csv_path)
-    csv_file   = open(csv_path, "a", newline="")
-    writer     = csv.DictWriter(csv_file, fieldnames=FIELDS)
+
+    # Build set of (wm_method, scale, image) rows already in the CSV so we can skip them
+    done = set()
+    if csv_exists:
+        with open(csv_path, newline="") as _f:
+            for r in csv.DictReader(_f):
+                done.add((r.get("wm_method", ""), r.get("scale", ""), r.get("image", "")))
+
+    csv_file = open(csv_path, "a", newline="")
+    writer   = csv.DictWriter(csv_file, fieldnames=FIELDS)
     if not csv_exists:
         writer.writeheader()
 
-    all_stats   = {}   # (wm_method, scale) -> _MethodStats
-    wm_objects  = {}   # wm_method -> Watermark instance (or None if init failed)
+    all_stats  = {}
+    wm_objects = {}
 
+    # Total progress units = images × scales (each (image, scale) pair = 1 unit)
+    method_dirs  = [(m, imgs) for m, imgs in _iter_method_dirs(test_folder)]
+    total_units  = sum(len(imgs) for _, imgs in method_dirs) * len(scales)
+
+    pbar = tqdm(total=total_units, unit="img", dynamic_ncols=True)
     try:
-        for wm_method, images in _iter_method_dirs(test_folder):
+        for wm_method, images in method_dirs:
+            if wm_method not in ['rivaGan']:
+                continue
             mod = _load_method(wm_method)
             if mod is None:
+                pbar.update(len(images) * len(scales))
                 continue
 
             if wm_method not in wm_objects:
                 try:
+                    pbar.set_description(f"Loading {wm_method}")
                     wm_objects[wm_method] = mod.Watermark()
                 except Exception:
-                    print(f"[{wm_method}] Cannot init Watermark:\n"
-                          f"{traceback.format_exc(limit=2)}")
+                    tqdm.write(f"[{wm_method}] Cannot init Watermark: "
+                               f"{traceback.format_exc(limit=1).strip()}")
                     wm_objects[wm_method] = None
             wm = wm_objects[wm_method]
             if wm is None:
+                pbar.update(len(images) * len(scales))
                 continue
 
-            for img_path in images:
+            for img_path in (images[:n_samples] if n_samples else images):
                 filename = img_path.name
-                print(f"\n[{wm_method}] {filename}")
+                pbar.set_description(f"{wm_method}/{filename}")
+
+                pending_scales = [s for s in scales
+                                  if (wm_method, str(s), filename) not in done]
+                skipped = len(scales) - len(pending_scales)
+                if skipped:
+                    pbar.update(skipped)
+                if not pending_scales:
+                    continue
 
                 wm_t = _to_tensor(Image.open(img_path))
 
@@ -316,38 +349,36 @@ def run_evaluation(attack="compat", test_folder=None, out_dir=None,
                     verify_wm       = wm.verify_watermark(str(img_path))
                     wm_detected     = _get_detected(verify_wm)
                     wm_bit_accuracy = verify_wm.get("bit_accuracy", "") if isinstance(verify_wm, dict) else ""
-                    print(f"  wm verify  : {verify_wm}")
                 except Exception:
-                    print(f"  wm verify ERROR: {traceback.format_exc(limit=2)}")
+                    tqdm.write(f"wm verify ERROR [{wm_method}] {filename}: "
+                               f"{traceback.format_exc(limit=1).strip()}")
 
-                for scale in scales:
+                for scale in pending_scales:
                     key = (wm_method, scale)
                     if key not in all_stats:
                         all_stats[key] = _MethodStats()
                     stats = all_stats[key]
 
-                    recon_dir = os.path.join(out_dir, f"scale_{scale}", wm_method)
+                    recon_dir  = os.path.join(out_dir, f"scale_{scale}", wm_method)
+                    recon_path = os.path.join(recon_dir, filename)
                     os.makedirs(recon_dir, exist_ok=True)
 
-                    if os.path.exists(os.path.join(recon_dir, filename)):
-                        print(f"  [{attack}] scale={scale}  skip (output exists)")
-                        continue
-
                     row = {f: "" for f in FIELDS}
-                    row["removal_method"]   = attack
-                    row["image"]            = filename
-                    row["wm_method"]        = wm_method
-                    row["scale"]            = scale
-                    row["wm_detected"]      = wm_detected
-                    row["wm_bit_accuracy"]  = wm_bit_accuracy
-                    attacked_detected       = None
-                    atk_bit_accuracy        = ""
+                    row["removal_method"]  = attack
+                    row["image"]           = filename
+                    row["wm_method"]       = wm_method
+                    row["scale"]           = scale
+                    row["wm_detected"]     = wm_detected
+                    row["wm_bit_accuracy"] = wm_bit_accuracy
+                    attacked_detected      = None
+                    atk_bit_accuracy       = ""
 
                     try:
-                        recon_path = remove_wm(str(img_path),
-                                               out_dir=recon_dir,
-                                               scale=scale,
-                                               **attack_kwargs)
+                        if not os.path.exists(recon_path):
+                            recon_path = remove_wm(str(img_path),
+                                                   out_dir=recon_dir,
+                                                   scale=scale,
+                                                   **attack_kwargs)
 
                         def _load_recon(p):
                             t = _to_tensor(Image.open(p).convert("RGB"))
@@ -367,26 +398,35 @@ def run_evaluation(attack="compat", test_folder=None, out_dir=None,
                         atk_bit_accuracy              = verify_atk.get("bit_accuracy", "") if isinstance(verify_atk, dict) else ""
                         row["attacked_detected"]      = attacked_detected
                         row["attacked_bit_accuracy"]  = atk_bit_accuracy
-                        print(f"  [{attack}] scale={scale}  atk verify : {verify_atk}")
 
-                        row["psnr"]  = round(_metrics.psnr(wm_t, recon_t), 4)
-                        row["ssim"]  = round(_metrics.ssim(wm_t, recon_t), 4)
-                        row["lpips"] = round(_metrics.lpips(wm_t, recon_t), 4)
-                        print(f"  [{attack}] scale={scale}  "
-                              f"PSNR={row['psnr']} dB  SSIM={row['ssim']}  LPIPS={row['lpips']}")
+                        row["psnr"]       = round(_metrics.psnr(wm_t, recon_t), 4)
+                        row["ssim"]       = round(_metrics.ssim(wm_t, recon_t), 4)
+                        row["lpips"]      = round(_metrics.lpips(wm_t, recon_t), 4)
+                        row["clip_score"] = round(_metrics.clip_score(wm_t, recon_t), 4)
+                        del recon_t
+
+                        pbar.set_postfix(
+                            scale=scale,
+                            det=str(attacked_detected),
+                            psnr=row["psnr"],
+                            ssim=row["ssim"],
+                        )
 
                     except Exception:
                         err = traceback.format_exc(limit=3)
                         row["error"] = err.replace("\n", " | ")
-                        print(f"  [{attack}] scale={scale}  ERROR: {err}")
+                        tqdm.write(f"ERROR [{wm_method}] {filename} scale={scale}: "
+                                   f"{err.splitlines()[-1]}")
 
                     stats.update(wm_detected, wm_bit_accuracy,
                                  attacked_detected, atk_bit_accuracy,
-                                 row["psnr"], row["ssim"], row["lpips"])
+                                 row["psnr"], row["ssim"], row["lpips"], row["clip_score"])
                     writer.writerow(row)
                     csv_file.flush()
+                    pbar.update(1)
 
     finally:
+        pbar.close()
         csv_file.close()
 
     summary_rows = [s.summary(attack, wm, sc)
@@ -399,13 +439,14 @@ def run_evaluation(attack="compat", test_folder=None, out_dir=None,
 
     print(f"\n{'removal':<20} {'wm_method':<18} {'scale':>6} {'total':>6} "
           f"{'wm_acc':>8} {'wm_ba':>8} {'atk_acc':>8} {'atk_ba':>8} "
-          f"{'avg_psnr':>10} {'avg_ssim':>9} {'avg_lpips':>10}")
-    print("-" * 115)
+          f"{'avg_psnr':>10} {'avg_ssim':>9} {'avg_lpips':>10} {'avg_clip':>9}")
+    print("-" * 126)
     for r in summary_rows:
         print(f"{r['removal_method']:<20} {r['wm_method']:<18} {str(r['scale']):>6} "
               f"{r['total']:>6} {str(r['wm_accuracy']):>8} {str(r['avg_wm_bit_accuracy']):>8} "
               f"{str(r['attacked_accuracy']):>8} {str(r['avg_attacked_bit_accuracy']):>8} "
-              f"{str(r['avg_psnr']):>10} {str(r['avg_ssim']):>9} {str(r['avg_lpips']):>10}")
+              f"{str(r['avg_psnr']):>10} {str(r['avg_ssim']):>9} {str(r['avg_lpips']):>10} "
+              f"{str(r['avg_clip_score']):>9}")
 
     print(f"\nPer-image results : {csv_path}")
     print(f"Summary           : {summary_csv}")
@@ -433,6 +474,8 @@ def main():
                         help="enable SAM2 segmentation features in COMPAT")
     parser.add_argument("--use-lbp",  action="store_true",
                         help="enable LBP texture features in COMPAT")
+    parser.add_argument("--n-samples", type=int, default=None,
+                        help="max images to evaluate per watermark folder (default: all)")
     parser.add_argument("--scale", type=float, default=None,
                         help="single downsample scale (default: use ATTACK_SCALES list)")
     parser.add_argument("--steps", type=int, default=None,
@@ -468,6 +511,7 @@ def main():
         skip_removal=args.skip_removal,
         use_sam2=args.use_sam2,
         use_lbp=args.use_lbp,
+        n_samples=args.n_samples,
     )
 
 
