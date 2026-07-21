@@ -72,13 +72,15 @@ IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 # ── Attack registry ───────────────────────────────────────────────────────────
 # name -> module name that exposes remove_watermark(image_path, out_dir, **kwargs)
 ATTACKS = {
-    "compat":         "compat",
-    "compat_flux_v2": "compat_flux_v2",
+    "compat":          "compat",
+    "compat_flux_v2":  "compat_flux_v2",
+    "compat_omnigen2": "compat_omnigen2",
     # "diffusion":      "attacks.diffusion_attack.diffusion_attack",
 }
 
 _ALIASES = {
     "sd3": "diffusion",
+    "omnigen2": "compat_omnigen2",
 }
 
 

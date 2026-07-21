@@ -56,6 +56,7 @@ watermark methods (VINE, EditGuard, OmniGuard, WAM).
 |---|---|
 | `compat` (Flux2Klein) | Local FLUX.2-klein path. Set `COMPAT_FLUX_MODEL=/path/to/FLUX.2-klein-4B` (edit `compat_flux.py` default otherwise). |
 | `compat_sr` | Auto-downloaded from HuggingFace (`caidas/swin2SR-*`, `ai-toolkit/flux2_vae`). |
+| `compat_omnigen2` (OmniGen2) | Needs the [OmniGen2](https://github.com/VectorSpaceLab/OmniGen2) package (`pip install -e .` a clone, or set `OMNIGEN2_REPO=/path/to/OmniGen2`). Weights auto-download from `OmniGen2/OmniGen2`; override with `OMNIGEN2_MODEL`. |
 | `nfpa` | Auto-downloads `stabilityai/stable-diffusion-2-1-base`; override with `NFPA_MODEL=/path`. |
 | `dwt_dct`, `ssl_watermarking`, `trustmark`, `watermark_anything`, `vine` | Auto-download / bundled. |
 | `editguard` | Manual: download `clean.pth` (Google Drive link in `watermarks/editguard/README_INTEGRATION.md`) → set `EDITGUARD_CKPT`. |
@@ -107,9 +108,10 @@ results under `test_folder/<method>/`.
 One runner, one function, selectable attack:
 
 ```bash
-python eval.py --attack compat        # Flux2Klein removal (default)
-python eval.py --attack nfpa          # Next-Frame Prediction attack
-python eval.py --attack compat_sr     # Swin2SR + FluxVAE removal
+python eval.py --attack compat            # Flux2Klein removal (default)
+python eval.py --attack compat_omnigen2   # OmniGen2 instruction-guided editing
+python eval.py --attack nfpa              # Next-Frame Prediction attack
+python eval.py --attack compat_sr        # Swin2SR + FluxVAE removal
 ```
 
 Common options:
