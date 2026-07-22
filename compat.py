@@ -71,9 +71,15 @@ class COMPAT:
             self._mask_generator = SAM2AutomaticMaskGenerator(sam2_model)
             print(f"Loaded SAM2 from {sam2_checkpoint}")
 
-    def degrade_scale(self, image: Image.Image, scale: int = 128) -> Image.Image:
+    def degrade_scale(self, image: Image.Image, scale=128) -> Image.Image:
         image = TF.to_tensor(image).unsqueeze(0)
-        lr = F.interpolate(image, size=(scale, scale), mode="bilinear",
+        H, W = image.shape[-2:]
+        # float < 1 → fraction of original dims; otherwise absolute pixel size
+        if isinstance(scale, float) and scale < 1.0:
+            s = (max(1, int(H * scale)), max(1, int(W * scale)))
+        else:
+            s = (int(scale), int(scale))
+        lr = F.interpolate(image, size=s, mode="bilinear",
                        align_corners=False, antialias=True)
         lr_pil = TF.to_pil_image(lr[0].clamp(0, 1))
         return lr_pil

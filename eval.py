@@ -110,11 +110,13 @@ def load_remover(attack, skip_removal=False, use_sam2=False, use_lbp=False):
         return _stub
     key = _resolve_attack_name(attack)
     mod = importlib.import_module(ATTACKS[key])
+    import inspect
     for attr in dir(mod):
         cls = getattr(mod, attr)
-        if isinstance(cls, type) and hasattr(cls, "remove_watermark"):
+        if (isinstance(cls, type)
+                and cls.__module__ == mod.__name__
+                and hasattr(cls, "remove_watermark")):
             init_kwargs = {}
-            import inspect
             sig = inspect.signature(cls.__init__)
             if "use_sam2" in sig.parameters:
                 init_kwargs["use_sam2"] = use_sam2
@@ -311,8 +313,6 @@ def run_evaluation(attack="compat", test_folder=None, out_dir=None,
     pbar = tqdm(total=total_units, unit="img", dynamic_ncols=True)
     try:
         for wm_method, images in method_dirs:
-            if wm_method not in ['rivaGan']:
-                continue
             mod = _load_method(wm_method)
             if mod is None:
                 pbar.update(len(images) * len(scales))

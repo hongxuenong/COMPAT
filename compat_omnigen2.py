@@ -56,7 +56,7 @@ class COMPAT_omnigen2(COMPAT):
     )
 
     def __init__(self, model_path: str = _OMNIGEN2_MODEL, weight_dtype=dtype,
-                 num_inference_steps: int = 50, text_guidance_scale: float = 5.0,
+                 num_inference_steps: int = 10, text_guidance_scale: float = 5.0,
                  image_guidance_scale: float = 2.0, cfg_range: tuple = (0.0, 1.0),
                  max_sequence_length: int = 1024, negative_prompt: str = _OMNIGEN2_NEG,
                  instruction: str = None, seed: int = 0, cpu_offload: bool = False,
