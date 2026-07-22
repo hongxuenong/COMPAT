@@ -16,14 +16,17 @@ Usage:
 """
 
 import csv
+import gc
 import importlib
 import itertools
 import os
 import traceback
 import sys
 
+from tqdm import tqdm
+
 os.environ.setdefault("CUDA_DEVICE_ORDER",    "PCI_BUS_ID")
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "1")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
@@ -49,27 +52,30 @@ IMG_EXTS    = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tiff"}
 # ── Ablation grid ─────────────────────────────────────────────────────────────
 # Each entry: (degrade_method, param_name, param_value)
 DEGRADE_CONFIGS = [
-    ("scale", "scale",   0.125),
-    ("scale", "scale",   0.25),
-    ("scale", "scale",   0.5),
-    ("blur",  "sigma",   2.0),
-    ("blur",  "sigma",   5.0),
-    ("noise", "std",     0.05),
-    ("noise", "std",     0.1),
-    ("jpeg",  "quality", 30),
-    ("jpeg",  "quality", 60),
+    # ("scale", "scale",   64),
+    # ("scale", "scale",   128),
+    ("scale", "scale",   192),
+    ("scale", "scale",   256),
+    # ("blur",  "sigma",   2.0),
+    # ("blur",  "sigma",   5.0),
+    ("blur",  "sigma",   8.0),
+    # ("noise", "std",     0.05),
+    # ("noise", "std",     0.1),
+    ("noise", "std",     0.5),
+    # ("jpeg",  "quality", 30),
+    # ("jpeg",  "quality", 60),
+    ("jpeg",  "quality", 90),
 ]
 
-USE_SAM2_OPTIONS        = [True, False]
-USE_LBP_OPTIONS         = [True, False]
-USE_FIND_EDGES_OPTIONS  = [True, False]
+USE_SAM2_OPTIONS = [True, False]
+USE_LBP_OPTIONS  = [True, False]
 
 # ── CSV schema ────────────────────────────────────────────────────────────────
 
 FIELDS = [
     "wm_method", "image",
     "degrade_method", "degrade_param", "degrade_value",
-    "use_sam2", "use_lbp", "use_find_edges",
+    "use_sam2", "use_lbp",
     "attacked_detected", "attacked_bit_accuracy",
     "psnr", "ssim", "lpips", "clip_score",
     "error",
@@ -77,7 +83,7 @@ FIELDS = [
 
 SUMMARY_FIELDS = [
     "degrade_method", "degrade_param", "degrade_value",
-    "use_sam2", "use_lbp", "use_find_edges",
+    "use_sam2", "use_lbp",
     "wm_method", "total",
     "attacked_accuracy", "avg_attacked_bit_accuracy",
     "avg_psnr", "avg_ssim", "avg_lpips", "avg_clip_score",
@@ -151,7 +157,7 @@ class _Stats:
         if clip != "":
             self.clip += float(clip)
 
-    def summary(self, deg_method, deg_param, deg_val, use_sam2, use_lbp, use_find_edges, wm_method):
+    def summary(self, deg_method, deg_param, deg_val, use_sam2, use_lbp, wm_method):
         def avg(s, n): return round(s / n, 4) if n else ""
         return {
             "degrade_method":            deg_method,
@@ -159,7 +165,6 @@ class _Stats:
             "degrade_value":             deg_val,
             "use_sam2":                  use_sam2,
             "use_lbp":                   use_lbp,
-            "use_find_edges":            use_find_edges,
             "wm_method":                 wm_method,
             "total":                     self.total,
             "attacked_accuracy":         avg(self.atk_det,    self.atk_dec),
@@ -191,50 +196,67 @@ def run_ablation(test_folder=TEST_FOLDER, out_dir="ablation_out", n_samples=None
     if not sum_exists:
         summary_writer.writeheader()
 
-    all_stats = {}   # (deg_method, deg_param, deg_val, use_sam2, use_lbp, use_find_edges, wm_method) -> _Stats
+    # Build resume set from existing CSV
+    done = set()
+    if csv_exists:
+        with open(csv_path, newline="") as _f:
+            for r in csv.DictReader(_f):
+                done.add((r.get("wm_method", ""), r.get("image", ""),
+                          r.get("degrade_method", ""), r.get("degrade_value", ""),
+                          r.get("use_sam2", ""), r.get("use_lbp", "")))
 
+    all_stats = {}
+
+    combos = list(itertools.product(DEGRADE_CONFIGS, USE_SAM2_OPTIONS, USE_LBP_OPTIONS))
+    method_dirs   = [(m, imgs) for m, imgs in _iter_method_dirs(test_folder)]
+    images_per_method = {m: (imgs[:n_samples] if n_samples else imgs) for m, imgs in method_dirs}
+    total_images  = sum(len(v) for v in images_per_method.values())
+    total_units   = len(combos) * total_images
+
+    pbar = tqdm(total=total_units, unit="img", dynamic_ncols=True)
     try:
-        combos = list(itertools.product(DEGRADE_CONFIGS, USE_SAM2_OPTIONS, USE_LBP_OPTIONS,
-                                        USE_FIND_EDGES_OPTIONS))
-        total_combos = len(combos)
-
-        for combo_idx, ((deg_method, deg_param, deg_val), use_sam2, use_lbp, use_find_edges) in enumerate(combos):
-            config_tag = f"{deg_method}={deg_val} sam2={use_sam2} lbp={use_lbp} edges={use_find_edges}"
-            print(f"\n{'='*70}")
-            print(f"[{combo_idx+1}/{total_combos}] Config: {config_tag}")
-            print(f"{'='*70}")
+        for combo_idx, ((deg_method, deg_param, deg_val), use_sam2, use_lbp) in enumerate(combos):
+            config_tag = f"{deg_method}={deg_val} sam2={use_sam2} lbp={use_lbp}"
+            tqdm.write(f"\n[{combo_idx+1}/{len(combos)}] {config_tag}")
 
             try:
-                model = COMPAT(use_sam2=use_sam2, use_lbp=use_lbp, use_find_edges=use_find_edges)
+                model = COMPAT(use_sam2=use_sam2, use_lbp=use_lbp)
             except Exception:
-                print(f"  Cannot init COMPAT:\n{traceback.format_exc(limit=2)}")
+                tqdm.write(f"  Cannot init COMPAT: {traceback.format_exc(limit=1).strip()}")
+                pbar.update(total_images)
                 continue
 
-            recon_base = os.path.join(out_dir,
-                f"{deg_method}_{deg_val}_sam2{use_sam2}_lbp{use_lbp}_edges{use_find_edges}")
+            recon_base = os.path.join(out_dir, f"{deg_method}_{deg_val}_sam2{use_sam2}_lbp{use_lbp}")
 
-            for wm_method, images in _iter_method_dirs(test_folder):
+            for wm_method, sample in images_per_method.items():
                 wm = wm_objects.get(wm_method)
                 if wm is None:
+                    pbar.update(len(sample))
                     continue
 
                 recon_dir = os.path.join(recon_base, wm_method)
                 os.makedirs(recon_dir, exist_ok=True)
 
-                stats_key = (deg_method, deg_param, deg_val, use_sam2, use_lbp, use_find_edges, wm_method)
+                stats_key = (deg_method, deg_param, deg_val, use_sam2, use_lbp, wm_method)
                 if stats_key not in all_stats:
                     all_stats[stats_key] = _Stats()
                 stats = all_stats[stats_key]
 
-                sample = images[:n_samples] if n_samples else images
                 for img_path in sample:
                     filename = img_path.name
+                    pbar.set_description(f"{config_tag}/{wm_method}/{filename}")
+
+                    done_key = (wm_method, filename, deg_method, str(deg_val),
+                                str(use_sam2), str(use_lbp))
+                    if done_key in done:
+                        pbar.update(1)
+                        continue
+
                     row = {f: "" for f in FIELDS}
                     row.update({
                         "wm_method": wm_method, "image": filename,
                         "degrade_method": deg_method, "degrade_param": deg_param,
                         "degrade_value": deg_val, "use_sam2": use_sam2, "use_lbp": use_lbp,
-                        "use_find_edges": use_find_edges,
                     })
 
                     atk_detected = atk_ba = psnr = ssim = lpips = clip = ""
@@ -261,15 +283,13 @@ def run_ablation(test_folder=TEST_FOLDER, out_dir="ablation_out", n_samples=None
                         lpips = round(_metrics.lpips(wm_t, recon_t), 4)
                         clip  = round(_metrics.clip_score(wm_t, recon_t), 4)
                         del wm_t, recon_t
-                        ba_str = f"{atk_ba:.3f}" if atk_ba != "" else "n/a"
-                        print(f"  [{wm_method}] {filename}: "
-                              f"atk_det={atk_detected} ba={ba_str} "
-                              f"PSNR={psnr} SSIM={ssim} LPIPS={lpips} CLIP={clip}")
+
+                        pbar.set_postfix(det=str(atk_detected), psnr=psnr, ssim=ssim)
 
                     except Exception:
                         err = traceback.format_exc(limit=3)
                         row["error"] = err.replace("\n", " | ")
-                        print(f"  [{wm_method}] {filename} ERROR: {err}")
+                        tqdm.write(f"ERROR [{wm_method}] {filename}: {err.splitlines()[-1]}")
 
                     row.update({"attacked_detected": atk_detected,
                                 "attacked_bit_accuracy": atk_ba,
@@ -277,22 +297,23 @@ def run_ablation(test_folder=TEST_FOLDER, out_dir="ablation_out", n_samples=None
                     stats.update(atk_detected, atk_ba, psnr, ssim, lpips, clip)
                     writer.writerow(row)
                     csv_file.flush()
+                    pbar.update(1)
 
             del model
+            gc.collect()
             torch.cuda.empty_cache()
 
-            # Write summary rows for this combo immediately after it finishes
             combo_summaries = [
-                all_stats[(deg_method, deg_param, deg_val, use_sam2, use_lbp, use_find_edges, wm_method)].summary(
-                    deg_method, deg_param, deg_val, use_sam2, use_lbp, use_find_edges, wm_method)
+                all_stats[(deg_method, deg_param, deg_val, use_sam2, use_lbp, wm_method)].summary(
+                    deg_method, deg_param, deg_val, use_sam2, use_lbp, wm_method)
                 for wm_method in wm_objects
-                if (deg_method, deg_param, deg_val, use_sam2, use_lbp, use_find_edges, wm_method) in all_stats
+                if (deg_method, deg_param, deg_val, use_sam2, use_lbp, wm_method) in all_stats
             ]
             summary_writer.writerows(combo_summaries)
             summary_file.flush()
-            print(f"  [summary] wrote {len(combo_summaries)} rows → {summary_path}")
 
     finally:
+        pbar.close()
         csv_file.close()
         summary_file.close()
 
